@@ -1,0 +1,57 @@
+version: '3.8'
+
+services:
+  db-migration:
+    build: .
+    container_name: database-migration-toolkit
+    environment:
+      # Override these in .env file or docker-compose.override.yml
+      - REMOTE_HOST=${REMOTE_HOST:-your-remote-host}
+      - REMOTE_PORT=${REMOTE_PORT:-3306}
+      - REMOTE_USER=${REMOTE_USER:-your-username}
+      - REMOTE_PASS=${REMOTE_PASS:-your-password}
+      - LOCAL_USER=${LOCAL_USER:-root}
+      - LOCAL_PASS=${LOCAL_PASS:-your-local-password}
+      - MAX_THREADS=${MAX_THREADS:-4}
+      - MAX_RETRY_ATTEMPTS=${MAX_RETRY_ATTEMPTS:-3}
+      - RETRY_DELAY=${RETRY_DELAY:-10}
+    volumes:
+      # Mount config directory for persistent configuration
+      - ./config:/app/config
+      # Mount data directory for persistent backups and logs
+      - ./data:/app/data
+      # Optional: Mount custom scripts
+      - ./scripts:/app/scripts
+    networks:
+      - db-migration-net
+    restart: unless-stopped
+    # Run in interactive mode to allow manual script execution
+    stdin_open: true
+    tty: true
+
+  # Optional: Local MySQL database for testing
+  mysql-local:
+    image: mysql:8.0
+    container_name: db-migration-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-rootpassword}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-testdb}
+      MYSQL_USER: ${MYSQL_USER:-testuser}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:-testpass}
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./data/mysql-init:/docker-entrypoint-initdb.d
+    networks:
+      - db-migration-net
+    restart: unless-stopped
+    command: --default-authentication-plugin=mysql_native_password
+
+volumes:
+  mysql-data:
+    driver: local
+
+networks:
+  db-migration-net:
+    driver: bridge

@@ -1,0 +1,31 @@
+# Configuration with sensitive data
+config/config.env
+
+# Backup files
+data/backups/
+*.sql
+
+# Log files
+data/logs/
+*.log
+sync_progress.log
+
+# Temporary files
+data/tmp/
+*.tmp
+sync_pids.tmp
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Runtime files
+*.pid
+nohup.out
