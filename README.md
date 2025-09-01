@@ -20,6 +20,43 @@ A comprehensive, multi-threaded database synchronization toolkit for migrating d
 - **Resource Management**: Configurable thread limits and retry policies
 - **Security**: Password handling via environment variables
 
+## Installation Options
+
+### 📦 Option 1: GitHub Packages (npm)
+
+```bash
+# Configure npm for GitHub Packages
+echo "@ugochukwu07:registry=https://npm.pkg.github.com" >> ~/.npmrc
+
+# Install globally
+npm install -g @ugochukwu07/db-migration-toolkit
+
+# Quick usage
+db-migrate-setup    # Run setup
+db-migrate-multi    # Multi-threaded sync
+```
+
+### 🐳 Option 2: Docker
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/ugochukwu07/db-migration-toolkit:latest
+
+# Run with volume mount for config
+docker run -it -v $(pwd)/config:/app/config ghcr.io/ugochukwu07/db-migration-toolkit:latest
+```
+
+### 📂 Option 3: Direct Download
+
+```bash
+# Use the installer script
+curl -sSL https://raw.githubusercontent.com/Ugochukwu07/db-migration-toolkit/master/install.sh | bash
+
+# Or manual git clone
+git clone https://github.com/Ugochukwu07/db-migration-toolkit.git
+cd db-migration-toolkit
+```
+
 ## Quick Start
 
 ### 1. Prerequisites

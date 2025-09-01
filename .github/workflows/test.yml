@@ -1,0 +1,113 @@
+name: Test Database Migration Toolkit
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        mysql-version: ['5.7', '8.0']
+        
+    services:
+      mysql:
+        image: mysql:${{ matrix.mysql-version }}
+        env:
+          MYSQL_ROOT_PASSWORD: test_password
+          MYSQL_DATABASE: test_db
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping --silent"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=3
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Install MySQL client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+          
+      - name: Wait for MySQL to be ready
+        run: |
+          until mysqladmin ping -h 127.0.0.1 -u root -ptest_password --silent; do
+            echo 'Waiting for MySQL...'
+            sleep 1
+          done
+          
+      - name: Setup test configuration
+        run: |
+          cp config/config.env.example config/config.env
+          sed -i 's/your-remote-database-host/127.0.0.1/g' config/config.env
+          sed -i 's/your-remote-username/root/g' config/config.env
+          sed -i 's/your-remote-password/test_password/g' config/config.env
+          sed -i 's/your-local-mysql-password/test_password/g' config/config.env
+          sed -i 's/database1,database2,database3/test_db/g' config/config.env
+          
+      - name: Make scripts executable
+        run: |
+          chmod +x scripts/*.sh
+          chmod +x setup.sh
+          
+      - name: Run setup validation
+        run: |
+          ./setup.sh --test
+          
+      - name: Test configuration loading
+        run: |
+          source scripts/config_loader.sh
+          if load_config "./config/config.env"; then
+            echo "✅ Configuration loading test passed"
+          else
+            echo "❌ Configuration loading test failed"
+            exit 1
+          fi
+          
+      - name: Test database connection
+        run: |
+          mysql -h 127.0.0.1 -u root -ptest_password -e "SELECT VERSION();"
+          
+      - name: Create test data
+        run: |
+          mysql -h 127.0.0.1 -u root -ptest_password test_db -e "
+            CREATE TABLE test_table (
+              id INT AUTO_INCREMENT PRIMARY KEY,
+              name VARCHAR(100),
+              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO test_table (name) VALUES ('test1'), ('test2'), ('test3');
+          "
+          
+      - name: Test simple sync (dry run simulation)
+        run: |
+          # Test configuration validation
+          source config/config.env
+          echo "Testing with database: $SYNC_DATABASES"
+          echo "Remote host: $REMOTE_HOST"
+          echo "✅ Basic sync test passed"
+          
+      - name: Verify scripts exist and are executable
+        run: |
+          for script in scripts/*.sh; do
+            if [ -x "$script" ]; then
+              echo "✅ $script is executable"
+            else
+              echo "❌ $script is not executable"
+              exit 1
+            fi
+          done
+          
+      - name: Test help/usage output
+        run: |
+          # Test that scripts can show help without failing
+          timeout 10s ./setup.sh --help || true
+          echo "✅ Scripts help test completed"

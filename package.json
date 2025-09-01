@@ -1,0 +1,97 @@
+{
+  "name": "@ugochukwu07/db-migration-toolkit",
+  "version": "1.0.0",
+  "description": "A comprehensive, multi-threaded database synchronization toolkit for migrating databases from remote sources to local MySQL instances",
+  "main": "setup.sh",
+  "bin": {
+    "db-migrate": "./scripts/sync_databases.sh",
+    "db-migrate-multi": "./scripts/multi_thread_sync.sh",
+    "db-migrate-table": "./scripts/multi_thread_table_sync.sh",
+    "db-migrate-monitor": "./scripts/run_with_monitor.sh",
+    "db-migrate-status": "./scripts/sync_status.sh",
+    "db-migrate-setup": "./setup.sh"
+  },
+  "scripts": {
+    "setup": "./setup.sh",
+    "test": "./setup.sh --test",
+    "sync": "./scripts/sync_databases.sh",
+    "sync-multi": "./scripts/multi_thread_sync.sh",
+    "sync-table": "./scripts/multi_thread_table_sync.sh",
+    "monitor": "./scripts/monitor_sync.sh",
+    "status": "./scripts/sync_status.sh",
+    "stop": "./scripts/stop_sync.sh",
+    "errors": "./scripts/view_errors.sh",
+    "import": "./scripts/import_from_backups.sh"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Ugochukwu07/db-migration-toolkit.git"
+  },
+  "keywords": [
+    "database",
+    "migration",
+    "mysql",
+    "synchronization",
+    "backup",
+    "multi-threaded",
+    "digitalocean",
+    "aws-rds",
+    "data-transfer",
+    "database-sync",
+    "database-backup",
+    "mysql-migration",
+    "database-replication",
+    "data-migration",
+    "devops",
+    "database-tools",
+    "bash",
+    "automation"
+  ],
+  "author": {
+    "name": "Ugochukwu Ekwueme",
+    "email": "ekwuemeugochukwu83@gmail.com",
+    "url": "https://github.com/Ugochukwu07"
+  },
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/Ugochukwu07/db-migration-toolkit/issues"
+  },
+  "homepage": "https://github.com/Ugochukwu07/db-migration-toolkit#readme",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "engines": {
+    "node": ">=12.0.0"
+  },
+  "os": [
+    "linux",
+    "darwin"
+  ],
+  "files": [
+    "scripts/",
+    "config/",
+    "docs/",
+    "setup.sh",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "QUICKSTART.md",
+    "Dockerfile",
+    "docker-compose.yml"
+  ],
+  "dependencies": {},
+  "devDependencies": {},
+  "peerDependencies": {
+    "mysql": ">=5.7.0"
+  },
+  "preferGlobal": true,
+  "directories": {
+    "doc": "docs",
+    "example": "config/examples"
+  },
+  "config": {
+    "setup_script": "./setup.sh",
+    "config_dir": "./config",
+    "scripts_dir": "./scripts"
+  }
+}

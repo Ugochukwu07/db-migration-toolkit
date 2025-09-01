@@ -1,0 +1,71 @@
+name: Publish Package to GitHub Packages
+
+on:
+  release:
+    types: [published]
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish-package:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          registry-url: 'https://npm.pkg.github.com'
+          scope: '@ugochukwu07'
+          
+      - name: Configure npm for GitHub Packages
+        run: |
+          echo "@ugochukwu07:registry=https://npm.pkg.github.com" >> ~/.npmrc
+          echo "//npm.pkg.github.com/:_authToken=${{ secrets.GITHUB_TOKEN }}" >> ~/.npmrc
+          
+      - name: Update package version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VERSION=${GITHUB_REF#refs/tags/v}
+          npm version $TAG_VERSION --no-git-tag-version
+          
+      - name: Make scripts executable
+        run: |
+          chmod +x scripts/*.sh
+          chmod +x setup.sh
+          
+      - name: Validate package
+        run: |
+          npm pack --dry-run
+          
+      - name: Publish to GitHub Packages
+        run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          
+      - name: Create release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tar -czf db-migration-toolkit-${GITHUB_REF#refs/tags/v}.tar.gz \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.github' \
+            scripts/ config/ docs/ *.md *.sh Dockerfile docker-compose.yml LICENSE
+            
+      - name: Upload release artifact
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: ./db-migration-toolkit-${{ github.event.release.tag_name }}.tar.gz
+          asset_name: db-migration-toolkit-${{ github.event.release.tag_name }}.tar.gz
+          asset_content_type: application/gzip
