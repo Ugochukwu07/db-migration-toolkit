@@ -94,31 +94,20 @@ sync_dump_database() {
     # Clear previous error log
     > "$error_file"
     
-    # Get mysqldump options from configuration
-    local dump_options=$(get_mysqldump_options)
-    
-    # Build mysqldump command
-    local dump_cmd="mysqldump -h\"$REMOTE_HOST\" -P\"${REMOTE_PORT:-3306}\" -u\"$REMOTE_USER\" -p\"$REMOTE_PASS\""
-    dump_cmd="$dump_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\" --single-transaction"
-    dump_cmd="$dump_cmd $dump_options \"$DB\""
+    # Get mysqldump options from configuration (array, no eval)
+    local -a dump_opts=()
+    read_dump_options dump_opts db
     
     if is_debug_mode; then
-        thread_log "DEBUG" "$DB" "Dump command: $dump_cmd"
+        thread_log "DEBUG" "$DB" "Dump command: mysqldump [remote connection] --single-transaction ${dump_opts[*]} $DB"
     fi
     
     # Execute dump command
-    eval "$dump_cmd" > "$backup_file" 2>"$error_file"
-
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 3 | tr '\n' ' ')
-        # Filter out password warnings (they're not real errors)
-        if echo "$error_msg" | grep -q "Using a password on the command line interface can be insecure" && [ -s "$backup_file" ]; then
-            thread_log "WARN" "$DB" "Dump completed with password warning (attempt $attempt)"
-        else
-            thread_log "ERROR" "$DB" "Dump failed (attempt $attempt): ${error_msg}"
-            echo "DUMP_ERROR:$DB:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-            return 1
-        fi
+    if ! remote_mysqldump --single-transaction "${dump_opts[@]}" "$DB" > "$backup_file" 2>"$error_file"; then
+        local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
+        thread_log "ERROR" "$DB" "Dump failed (attempt $attempt): ${error_msg}"
+        echo "DUMP_ERROR:$DB:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
+        return 1
     fi
 
     # Verify dump file was created and has content
@@ -152,36 +141,17 @@ sync_prepare_local_db() {
     
     # Drop existing database
     thread_log "INFO" "$DB" "Dropping existing local database $LOCAL_DB_NAME (if exists)..."
-    local drop_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    drop_cmd="$drop_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    drop_cmd="$drop_cmd -e 'DROP DATABASE IF EXISTS \`$LOCAL_DB_NAME\`'"
-    
-    eval "$drop_cmd" 2>"$error_file"
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 2 | tr '\n' ' ')
+    if ! local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$LOCAL_DB_NAME")" 2>"$error_file"; then
+        local error_msg=$(head -n 2 "$error_file" 2>/dev/null | tr '\n' ' ')
         thread_log "ERROR" "$DB" "Failed to drop database (attempt $attempt): ${error_msg}"
         echo "PREP_ERROR:$DB:attempt_$attempt:Drop failed - ${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
-    # Create fresh database
+    # Create fresh database (charset/collation come from validated config)
     thread_log "INFO" "$DB" "Creating fresh local database $LOCAL_DB_NAME..."
-    local create_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    create_cmd="$create_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    create_cmd="$create_cmd -e 'CREATE DATABASE \`$LOCAL_DB_NAME\`"
-    
-    # Add character set and collation if configured
-    if [ -n "${CHARSET:-}" ]; then
-        create_cmd="$create_cmd CHARACTER SET ${CHARSET}"
-    fi
-    if [ -n "${COLLATION:-}" ]; then
-        create_cmd="$create_cmd COLLATE ${COLLATION}"
-    fi
-    create_cmd="$create_cmd'"
-    
-    eval "$create_cmd" 2>"$error_file"
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 2 | tr '\n' ' ')
+    if ! local_mysql -e "$(create_database_sql "$LOCAL_DB_NAME")" 2>"$error_file"; then
+        local error_msg=$(head -n 2 "$error_file" 2>/dev/null | tr '\n' ' ')
         thread_log "ERROR" "$DB" "Failed to create database (attempt $attempt): ${error_msg}"
         echo "PREP_ERROR:$DB:attempt_$attempt:Create failed - ${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
@@ -211,37 +181,25 @@ sync_import_database() {
     > "$error_file"
     
     # Import dump into local DB
-    local import_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    import_cmd="$import_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
+    local -a import_args=()
+    local_import_args import_args
     
-    # Set SQL mode if configured
-    if [ -n "${SQL_MODE:-}" ]; then
-        import_cmd="$import_cmd --init-command=\"SET SESSION sql_mode='${SQL_MODE}'\""
-    fi
-    
-    import_cmd="$import_cmd \"$LOCAL_DB_NAME\""
-    
-    eval "$import_cmd" < "$backup_file" 2>"$error_file"
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 3 | tr '\n' ' ')
+    if ! local_mysql "${import_args[@]}" "$LOCAL_DB_NAME" < "$backup_file" 2>"$error_file"; then
+        local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
         thread_log "ERROR" "$DB" "Import failed (attempt $attempt): ${error_msg}"
         echo "IMPORT_ERROR:$DB:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
     # Verify import by checking if tables exist
-    local table_count_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    table_count_cmd="$table_count_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    table_count_cmd="$table_count_cmd \"$LOCAL_DB_NAME\" -e 'SHOW TABLES;' 2>/dev/null | wc -l"
-    
-    local table_count=$(eval "$table_count_cmd")
-    if [ "${table_count:-0}" -le 1 ]; then
+    local table_count=$(local_mysql -N -B "$LOCAL_DB_NAME" -e 'SHOW TABLES;' 2>/dev/null | wc -l)
+    if [ "${table_count:-0}" -lt 1 ]; then
         thread_log "ERROR" "$DB" "Import verification failed - no tables found (attempt $attempt)"
         echo "IMPORT_ERROR:$DB:attempt_$attempt:No tables found after import:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
-    thread_log "SUCCESS" "$DB" "Database import completed successfully ($((table_count - 1)) tables, attempt $attempt)"
+    thread_log "SUCCESS" "$DB" "Database import completed successfully ($table_count tables, attempt $attempt)"
     rm -f "$error_file"  # Clean up error file on success
     return 0
 }

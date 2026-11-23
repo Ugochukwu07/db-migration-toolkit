@@ -50,9 +50,13 @@ log "INFO" "Databases to sync: ${DATABASES[*]}"
 log "INFO" "Backup directory: $BACKUP_DIR"
 log "INFO" "Local database prefix: ${LOCAL_DB_PREFIX:-none}"
 
-# Get mysqldump options from configuration
-DUMP_OPTIONS=$(get_mysqldump_options)
-log "INFO" "Using mysqldump options: $DUMP_OPTIONS"
+# Get mysqldump options from configuration (split into an array, no eval)
+declare -a DUMP_OPTS=()
+read_dump_options DUMP_OPTS db
+log "INFO" "Using mysqldump options: ${DUMP_OPTS[*]}"
+
+declare -a IMPORT_ARGS=()
+local_import_args IMPORT_ARGS
 
 for DB in "${DATABASES[@]}"; do
     log "INFO" "Processing database: $DB"
@@ -61,16 +65,12 @@ for DB in "${DATABASES[@]}"; do
     # Generate local database name
     LOCAL_DB_NAME=$(get_local_database_name "$DB")
     
-    # Dump from remote DB with configured options
-    DUMP_CMD="mysqldump -h\"$REMOTE_HOST\" -P\"${REMOTE_PORT:-3306}\" -u\"$REMOTE_USER\" -p\"$REMOTE_PASS\""
-    DUMP_CMD="$DUMP_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\" --single-transaction"
-    DUMP_CMD="$DUMP_CMD $DUMP_OPTIONS \"$DB\""
-    
     if is_debug_mode; then
-        log "DEBUG" "Dump command: $DUMP_CMD > \"$BACKUP_DIR/$DB.sql\""
+        log "DEBUG" "Dump command: mysqldump [remote connection] --single-transaction ${DUMP_OPTS[*]} $DB > \"$BACKUP_DIR/$DB.sql\""
     fi
     
-    eval "$DUMP_CMD" > "$BACKUP_DIR/$DB.sql" 2>"$BACKUP_DIR/${DB}_dump_error.log"
+    # Dump from remote DB with configured options
+    remote_mysqldump --single-transaction "${DUMP_OPTS[@]}" "$DB" > "$BACKUP_DIR/$DB.sql" 2>"$BACKUP_DIR/${DB}_dump_error.log"
 
     if [ $? -ne 0 ]; then
         log "ERROR" "Failed to dump database $DB from remote server"
@@ -91,16 +91,7 @@ for DB in "${DATABASES[@]}"; do
 
     # Drop and create database
     log "INFO" "Dropping existing local database $LOCAL_DB_NAME (if exists)..."
-    DROP_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    DROP_CMD="$DROP_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    DROP_CMD="$DROP_CMD -e 'DROP DATABASE IF EXISTS \`$LOCAL_DB_NAME\`'"
-    
-    if is_debug_mode; then
-        log "DEBUG" "Drop command: $DROP_CMD"
-    fi
-    
-    eval "$DROP_CMD" 2>"$BACKUP_DIR/${DB}_drop_error.log"
-    if [ $? -ne 0 ]; then
+    if ! local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$LOCAL_DB_NAME")" 2>"$BACKUP_DIR/${DB}_drop_error.log"; then
         log "ERROR" "Failed to drop existing database $LOCAL_DB_NAME"
         if [ -f "$BACKUP_DIR/${DB}_drop_error.log" ]; then
             log "ERROR" "Error details: $(head -n 2 "$BACKUP_DIR/${DB}_drop_error.log" | tr '\n' ' ')"
@@ -110,25 +101,7 @@ for DB in "${DATABASES[@]}"; do
     rm -f "$BACKUP_DIR/${DB}_drop_error.log"
     
     log "INFO" "Creating fresh local database $LOCAL_DB_NAME..."
-    CREATE_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    CREATE_CMD="$CREATE_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    CREATE_CMD="$CREATE_CMD -e 'CREATE DATABASE \`$LOCAL_DB_NAME\`"
-    
-    # Add character set and collation if configured
-    if [ -n "${CHARSET:-}" ]; then
-        CREATE_CMD="$CREATE_CMD CHARACTER SET ${CHARSET}"
-    fi
-    if [ -n "${COLLATION:-}" ]; then
-        CREATE_CMD="$CREATE_CMD COLLATE ${COLLATION}"
-    fi
-    CREATE_CMD="$CREATE_CMD'"
-    
-    if is_debug_mode; then
-        log "DEBUG" "Create command: $CREATE_CMD"
-    fi
-    
-    eval "$CREATE_CMD" 2>"$BACKUP_DIR/${DB}_create_error.log"
-    if [ $? -ne 0 ]; then
+    if ! local_mysql -e "$(create_database_sql "$LOCAL_DB_NAME")" 2>"$BACKUP_DIR/${DB}_create_error.log"; then
         log "ERROR" "Failed to create database $LOCAL_DB_NAME"
         if [ -f "$BACKUP_DIR/${DB}_create_error.log" ]; then
             log "ERROR" "Error details: $(head -n 2 "$BACKUP_DIR/${DB}_create_error.log" | tr '\n' ' ')"
@@ -139,24 +112,11 @@ for DB in "${DATABASES[@]}"; do
 
     log "INFO" "Step 3/3: Importing dump into local database $LOCAL_DB_NAME..."
     
-    # Import dump into local DB
-    IMPORT_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    IMPORT_CMD="$IMPORT_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    
-    # Set SQL mode if configured
-    if [ -n "${SQL_MODE:-}" ]; then
-        IMPORT_CMD="$IMPORT_CMD --init-command=\"SET SESSION sql_mode='${SQL_MODE}'\""
-    fi
-    
-    IMPORT_CMD="$IMPORT_CMD \"$LOCAL_DB_NAME\""
-    
     if is_debug_mode; then
-        log "DEBUG" "Import command: $IMPORT_CMD < \"$BACKUP_DIR/$DB.sql\""
+        log "DEBUG" "Import command: mysql [local connection] ${IMPORT_ARGS[*]} $LOCAL_DB_NAME < \"$BACKUP_DIR/$DB.sql\""
     fi
     
-    eval "$IMPORT_CMD" < "$BACKUP_DIR/$DB.sql" 2>"$BACKUP_DIR/${DB}_import_error.log"
-    
-    if [ $? -ne 0 ]; then
+    if ! local_mysql "${IMPORT_ARGS[@]}" "$LOCAL_DB_NAME" < "$BACKUP_DIR/$DB.sql" 2>"$BACKUP_DIR/${DB}_import_error.log"; then
         log "ERROR" "Failed to import database $DB into local MySQL database $LOCAL_DB_NAME"
         if [ -f "$BACKUP_DIR/${DB}_import_error.log" ]; then
             log "ERROR" "Error details: $(head -n 3 "$BACKUP_DIR/${DB}_import_error.log" | tr '\n' ' ')"
@@ -170,17 +130,13 @@ for DB in "${DATABASES[@]}"; do
         rm -f "$BACKUP_DIR/${DB}_import_error.log"
         
         # Verify import by counting tables
-        TABLE_COUNT_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-        TABLE_COUNT_CMD="$TABLE_COUNT_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-        TABLE_COUNT_CMD="$TABLE_COUNT_CMD \"$LOCAL_DB_NAME\" -e 'SHOW TABLES;' 2>/dev/null | wc -l"
-        
-        table_count=$(eval "$TABLE_COUNT_CMD")
-        if [ "${table_count:-0}" -gt 1 ]; then
-            log "INFO" "Import verified: $((table_count - 1)) tables found in $LOCAL_DB_NAME"
+        table_count=$(local_mysql -N -B "$LOCAL_DB_NAME" -e 'SHOW TABLES;' 2>/dev/null | wc -l)
+        if [ "${table_count:-0}" -gt 0 ]; then
+            log "INFO" "Import verified: $table_count tables found in $LOCAL_DB_NAME"
         fi
     fi
     
-    log "INFO" "Finished processing database: $DB -> $LOCAL_DB_NAME"
+log "INFO" "Finished processing database: $DB -> $LOCAL_DB_NAME"
     echo "----------------------------------------"
 done
 

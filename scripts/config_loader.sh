@@ -191,6 +191,14 @@ validate_config() {
         fi
     done
     
+    # CHARSET / COLLATION are interpolated into SQL, so restrict them
+    for var in CHARSET COLLATION; do
+        if [ -n "${!var:-}" ] && ! [[ "${!var}" =~ ^[A-Za-z0-9_]+$ ]]; then
+            config_log "ERROR" "$var may only contain letters, digits and underscores"
+            ((validation_errors++))
+        fi
+    done
+    
     if [ $validation_errors -eq 0 ]; then
         config_log "INFO" "Configuration validation passed"
         return 0
@@ -208,9 +216,7 @@ test_database_connections() {
     
     # Test remote database connection
     config_log "INFO" "Testing remote database connection..."
-    if mysql -h"${REMOTE_HOST}" -P"${REMOTE_PORT:-3306}" -u"${REMOTE_USER}" -p"${REMOTE_PASS}" \
-             --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" \
-             -e "SELECT VERSION();" >/dev/null 2>&1; then
+    if remote_mysql -e "SELECT VERSION();" >/dev/null 2>&1; then
         config_log "INFO" "Remote database connection successful"
     else
         config_log "ERROR" "Remote database connection failed"
@@ -219,9 +225,7 @@ test_database_connections() {
     
     # Test local database connection
     config_log "INFO" "Testing local database connection..."
-    if mysql -h"${LOCAL_HOST:-localhost}" -P"${LOCAL_PORT:-3306}" -u"${LOCAL_USER}" -p"${LOCAL_PASS}" \
-             --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" \
-             -e "SELECT VERSION();" >/dev/null 2>&1; then
+    if local_mysql -e "SELECT VERSION();" >/dev/null 2>&1; then
         config_log "INFO" "Local database connection successful"
     else
         config_log "ERROR" "Local database connection failed"
@@ -289,6 +293,11 @@ init_config() {
         fi
     fi
     
+    # Create private credential files (no passwords on command lines)
+    if ! init_credentials; then
+        return 1
+    fi
+    
     # Test database connections if enabled and not validation-only
     if [ "$validate_only" != "true" ] && [ "${TEST_CONNECTIONS:-true}" = "true" ]; then
         if ! test_database_connections; then
@@ -339,6 +348,114 @@ should_drop_existing_tables() {
     [ "${DROP_EXISTING_TABLE:-true}" = "true" ]
 }
 
+# === SAFE MYSQL INVOCATION HELPERS ===
+# Credentials are never placed on a command line (visible in `ps`) and
+# commands are never built as strings for eval. Instead each connection gets
+# a private (mode 600) option file passed with --defaults-extra-file, and all
+# arguments are passed as properly quoted words.
+
+_CRED_DIR=""
+
+# Escape a value for use inside a double-quoted option-file string
+_cnf_escape() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '%s' "$v"
+}
+
+# Write a client option file: _write_cnf <file> <host> <port> <user> <password>
+_write_cnf() {
+    local file="$1" host="$2" port="$3" user="$4" pass="$5"
+    case "$host$port$user$pass" in
+        *$'\n'*|*$'\r'*)
+            config_log "ERROR" "Credentials must not contain newline characters"
+            return 1
+            ;;
+    esac
+    (
+        umask 077
+        {
+            echo "[client]"
+            echo "host=\"$(_cnf_escape "$host")\""
+            echo "port=\"$(_cnf_escape "$port")\""
+            echo "user=\"$(_cnf_escape "$user")\""
+            echo "password=\"$(_cnf_escape "$pass")\""
+        } > "$file"
+    )
+}
+
+# Remove credential files (also runs on exit)
+cleanup_credentials() {
+    if [ -n "$_CRED_DIR" ] && [ -d "$_CRED_DIR" ]; then
+        rm -rf "$_CRED_DIR"
+    fi
+    _CRED_DIR=""
+}
+
+# Create credential files for the remote and local servers.
+# Must be called once in the main process BEFORE any background jobs start.
+init_credentials() {
+    cleanup_credentials
+    _CRED_DIR=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/dbmig-cred.XXXXXX") || {
+        config_log "ERROR" "Could not create a private directory for credentials"
+        return 1
+    }
+    REMOTE_CNF="$_CRED_DIR/remote.cnf"
+    LOCAL_CNF="$_CRED_DIR/local.cnf"
+    _write_cnf "$REMOTE_CNF" "$REMOTE_HOST" "${REMOTE_PORT:-3306}" "$REMOTE_USER" "$REMOTE_PASS" || return 1
+    _write_cnf "$LOCAL_CNF" "${LOCAL_HOST:-localhost}" "${LOCAL_PORT:-3306}" "$LOCAL_USER" "$LOCAL_PASS" || return 1
+    export REMOTE_CNF LOCAL_CNF
+    trap cleanup_credentials EXIT
+    trap 'cleanup_credentials; exit 130' INT
+    trap 'cleanup_credentials; exit 143' TERM
+}
+
+# Run mysql / mysqldump against the remote or local server.
+remote_mysql() {
+    mysql --defaults-extra-file="$REMOTE_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+local_mysql() {
+    mysql --defaults-extra-file="$LOCAL_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+remote_mysqldump() {
+    mysqldump --defaults-extra-file="$REMOTE_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+
+# Quote an SQL identifier (database/table name) with backticks
+sql_ident() {
+    local v="${1//\`/\`\`}"
+    printf '`%s`' "$v"
+}
+
+# CREATE DATABASE statement honouring CHARSET / COLLATION (validated elsewhere)
+create_database_sql() {
+    local name="$1" if_not_exists="${2:-false}" sql="CREATE DATABASE "
+    [ "$if_not_exists" = "true" ] && sql+="IF NOT EXISTS "
+    sql+="$(sql_ident "$name")"
+    [ -n "${CHARSET:-}" ] && sql+=" CHARACTER SET ${CHARSET}"
+    [ -n "${COLLATION:-}" ] && sql+=" COLLATE ${COLLATION}"
+    printf '%s' "$sql"
+}
+
+# Split the configured mysqldump option string into an array (no eval, no globbing)
+# Usage: read_dump_options <array_name> <table|db>
+read_dump_options() {
+    local -n _opts_ref=$1
+    local raw
+    if [ "${2:-db}" = "table" ]; then raw=$(get_mysqldump_table_options); else raw=$(get_mysqldump_options); fi
+    read -r -a _opts_ref <<< "$raw"
+}
+
+# Extra mysql args for imports (sql_mode). Usage: local_import_args <array_name>
+local_import_args() {
+    local -n _args_ref=$1
+    _args_ref=()
+    if [ -n "${SQL_MODE:-}" ]; then
+        _args_ref+=(--init-command="SET SESSION sql_mode='${SQL_MODE//\'/\'\'}'")
+    fi
+}
+
 # Export functions for use in other scripts
 export -f config_log
 export -f load_config
@@ -353,3 +470,6 @@ export -f get_mysqldump_options
 export -f get_mysqldump_table_options
 export -f is_debug_mode
 export -f should_drop_existing_tables
+export -f _cnf_escape _write_cnf cleanup_credentials init_credentials
+export -f remote_mysql local_mysql remote_mysqldump
+export -f sql_ident create_database_sql read_dump_options local_import_args

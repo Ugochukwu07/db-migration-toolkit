@@ -262,7 +262,7 @@ test_configuration() {
         log "SUCCESS" "All required configuration variables are set"
         
         # Test local MySQL connection (optional)
-        if mysql -u"$LOCAL_USER" -p"$LOCAL_PASS" -e "SELECT VERSION();" >/dev/null 2>&1; then
+        if MYSQL_PWD="$LOCAL_PASS" mysql -u"$LOCAL_USER" -e "SELECT VERSION();" >/dev/null 2>&1; then
             log "SUCCESS" "Local MySQL connection test passed"
         else
             log "WARN" "Local MySQL connection test failed - please verify credentials"
