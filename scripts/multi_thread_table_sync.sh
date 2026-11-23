@@ -127,7 +127,7 @@ sync_dump_table() {
     fi
 
     local dump_size=$(du -h "$backup_file" | cut -f1)
-    local row_count=$(grep -c "INSERT INTO" "$backup_file" 2>/dev/null || echo "0")
+    local row_count=$(grep -c "INSERT INTO" "$backup_file" 2>/dev/null || true)
     thread_log "SUCCESS" "$DB" "$TABLE" "Table dump completed successfully (Size: $dump_size, Inserts: $row_count, attempt $attempt)"
     rm -f "$error_file"  # Clean up error file on success
     return 0
@@ -160,31 +160,17 @@ sync_import_table() {
         return 1
     fi
     
-    # Drop existing table if configured to do so
-    if should_drop_existing_tables; then
-        thread_log "INFO" "$SOURCE_DB" "$TABLE" "Dropping existing table $TABLE (if exists)..."
-        if ! local_mysql "$local_db_name" -e "DROP TABLE IF EXISTS $(sql_ident "$TABLE")" 2>"$error_file"; then
-            local error_msg=$(head -n 2 "$error_file" 2>/dev/null | tr '\n' ' ')
-            thread_log "WARN" "$SOURCE_DB" "$TABLE" "Failed to drop existing table (attempt $attempt): ${error_msg}"
-            # Continue anyway, as the table might not exist
-        fi
-    fi
+    # Replace the table: existing data is snapshotted first and restored if the import fails
+    local safety_file="$BACKUP_DIR/pre-sync_${SOURCE_DB}_${TABLE}-${TIMESTAMP}.sql"
+    local drop_first=false
+    should_drop_existing_tables && drop_first=true
     
-    # Import table dump into local DB
-    local -a import_args=()
-    local_import_args import_args
-    
-    if ! local_mysql "${import_args[@]}" "$local_db_name" < "$backup_file" 2>"$error_file"; then
-        local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
-        thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Import failed (attempt $attempt): ${error_msg}"
+    replace_local_table "$local_db_name" "$TABLE" "$backup_file" "$safety_file" "$error_file" "$drop_first"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        local error_msg=$(tail -n 4 "$error_file" 2>/dev/null | tr '\n' ' ')
+        thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Import failed (rc=$rc, attempt $attempt): ${error_msg}"
         echo "IMPORT_ERROR:$SOURCE_DB:$TABLE:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-        return 1
-    fi
-    
-    # Verify import by checking that the table exists
-    if ! local_mysql -N -B "$local_db_name" -e "SHOW TABLES;" 2>/dev/null | grep -Fxq -- "$TABLE"; then
-        thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Import verification failed - table not found after import (attempt $attempt)"
-        echo "IMPORT_ERROR:$SOURCE_DB:$TABLE:attempt_$attempt:Table not found after import:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
@@ -418,12 +404,14 @@ SYNC_END_TIME=$(date +%s)
 TOTAL_DURATION=$((SYNC_END_TIME - SYNC_START_TIME))
 
 # === FINAL REPORT ===
+successful=0
+failed=0
 log "INFO" "All table synchronization processes completed"
 log "INFO" "Total execution time: ${TOTAL_DURATION}s"
 
 if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
-    successful=$(grep -c "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-    failed=$(grep -c "^FAILED:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
+    successful=$(grep -c "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || true)
+    failed=$(grep -c "^FAILED:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || true)
     
     log "INFO" "FINAL SUMMARY:"
     log "INFO" "  ✓ Successful: $successful tables"
@@ -450,8 +438,8 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
     # Show error summary if errors occurred
     if [ -f "$TMP_DIR/error_log-$TIMESTAMP.tmp" ]; then
         log "INFO" "Error Summary:"
-        dump_errors=$(grep -c "^DUMP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-        import_errors=$(grep -c "^IMPORT_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
+        dump_errors=$(grep -c "^DUMP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
+        import_errors=$(grep -c "^IMPORT_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
         
         log "INFO" "  - Dump errors: $dump_errors"
         log "INFO" "  - Import errors: $import_errors"
@@ -476,7 +464,7 @@ fi
 
 # Send notifications if configured
 if [ "${ENABLE_EMAIL_NOTIFICATIONS:-false}" = "true" ] && command -v mail >/dev/null 2>&1; then
-    local status_msg="Multi-threaded table synchronization completed"
+    status_msg="Multi-threaded table synchronization completed"
     if [ "$failed" -gt 0 ]; then
         status_msg="$status_msg with $failed failures"
     fi
@@ -485,7 +473,7 @@ if [ "${ENABLE_EMAIL_NOTIFICATIONS:-false}" = "true" ] && command -v mail >/dev/
 fi
 
 if [ "${ENABLE_WEBHOOK_NOTIFICATIONS:-false}" = "true" ] && [ -n "${WEBHOOK_URL:-}" ] && command -v curl >/dev/null 2>&1; then
-    local webhook_data="{\"text\":\"Multi-threaded table synchronization completed. Success: $successful, Failed: $failed\"}"
+    webhook_data="{\"text\":\"Multi-threaded table synchronization completed. Success: $successful, Failed: $failed\"}"
     curl -X POST -H "Content-Type: application/json" \
          -d "$webhook_data" \
          "${WEBHOOK_URL}" >/dev/null 2>&1 || true

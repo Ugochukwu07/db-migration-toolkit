@@ -456,6 +456,131 @@ local_import_args() {
     fi
 }
 
+# === SAFE REPLACE HELPERS (no data loss on a failed import) ===
+# Return codes for replace_local_database / replace_local_table:
+#   0 = replaced and verified
+#   1 = import/verification failed; previous data was restored (or nothing existed)
+#   2 = aborted before touching anything (could not snapshot existing data)
+#   3 = import failed AND restore failed; the pre-sync snapshot is kept on disk
+
+local_mysqldump() {
+    mysqldump --defaults-extra-file="$LOCAL_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+
+# Escape a value for a single-quoted SQL string literal
+_sql_str() { printf '%s' "${1//\'/\'\'}"; }
+
+# Remove the pre-sync snapshot unless the user asked to keep it
+_discard_safety() {
+    [ "${KEEP_PRE_SYNC_BACKUP:-false}" = "true" ] || rm -f -- "${1:?safety file required}"
+}
+
+# Replace a local database with the contents of a dump, rolling back on failure.
+# Usage: replace_local_database <local_db> <dump_file> <safety_file> <error_file>
+replace_local_database() {
+    local db="${1:?}" dump_file="${2:?}" safety_file="${3:?}" err_file="${4:?}"
+    local existed=0 found
+    local -a import_args=()
+    local_import_args import_args
+    : > "$err_file"
+
+    found=$(local_mysql -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='$(_sql_str "$db")'" 2>>"$err_file") || return 2
+    [ "${found:-0}" -gt 0 ] && existed=1
+
+    # 1. Snapshot the current local database so a failure cannot lose it
+    if [ "$existed" -eq 1 ]; then
+        if ! ( umask 077; local_mysqldump --single-transaction --routines --triggers --events --set-gtid-purged=OFF "$db" > "$safety_file" ) 2>>"$err_file"; then
+            echo "Could not snapshot existing database '$db'; leaving it untouched" >> "$err_file"
+            rm -f -- "$safety_file"
+            return 2
+        fi
+    fi
+
+    # 2. Replace
+    local ok=1
+    local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file" || ok=0
+    [ $ok -eq 1 ] && { local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" || ok=0; }
+    [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
+
+    # 3. Verify: if the dump defines tables, they must exist now
+    if [ $ok -eq 1 ] && grep -q "CREATE TABLE" "$dump_file"; then
+        local tables
+        tables=$(local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | wc -l)
+        if [ "${tables:-0}" -lt 1 ]; then
+            echo "Import verification failed: no tables found in '$db'" >> "$err_file"
+            ok=0
+        fi
+    fi
+
+    if [ $ok -eq 1 ]; then
+        _discard_safety "$safety_file"
+        return 0
+    fi
+
+    # 4. Roll back
+    local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file"
+    if [ "$existed" -eq 1 ]; then
+        if local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" \
+           && local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
+            echo "Rolled back: previous contents of '$db' restored" >> "$err_file"
+            _discard_safety "$safety_file"
+            return 1
+        fi
+        echo "ROLLBACK FAILED for '$db'. Previous data is preserved in: $safety_file" >> "$err_file"
+        return 3
+    fi
+    return 1
+}
+
+# Replace one local table with the contents of a dump, rolling back on failure.
+# Usage: replace_local_table <db> <table> <dump_file> <safety_file> <error_file> <drop_first:true|false>
+replace_local_table() {
+    local db="${1:?}" table="${2:?}" dump_file="${3:?}" safety_file="${4:?}" err_file="${5:?}" drop_first="${6:-true}"
+    local existed=0
+    local -a import_args=()
+    local_import_args import_args
+    : > "$err_file"
+
+    if local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
+        existed=1
+    fi
+
+    if [ "$existed" -eq 1 ]; then
+        if ! ( umask 077; local_mysqldump --single-transaction --triggers --set-gtid-purged=OFF "$db" "$table" > "$safety_file" ) 2>>"$err_file"; then
+            echo "Could not snapshot existing table '$db.$table'; leaving it untouched" >> "$err_file"
+            rm -f -- "$safety_file"
+            return 2
+        fi
+    fi
+
+    local ok=1
+    if [ "$drop_first" = "true" ]; then
+        local_mysql "$db" -e "DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file" || ok=0
+    fi
+    [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
+    if [ $ok -eq 1 ] && ! local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
+        echo "Import verification failed: table '$table' not found after import" >> "$err_file"
+        ok=0
+    fi
+
+    if [ $ok -eq 1 ]; then
+        _discard_safety "$safety_file"
+        return 0
+    fi
+
+    local_mysql "$db" -e "DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file"
+    if [ "$existed" -eq 1 ]; then
+        if local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
+            echo "Rolled back: previous contents of '$db.$table' restored" >> "$err_file"
+            _discard_safety "$safety_file"
+            return 1
+        fi
+        echo "ROLLBACK FAILED for '$db.$table'. Previous data is preserved in: $safety_file" >> "$err_file"
+        return 3
+    fi
+    return 1
+}
+
 # Export functions for use in other scripts
 export -f config_log
 export -f load_config
@@ -473,3 +598,4 @@ export -f should_drop_existing_tables
 export -f _cnf_escape _write_cnf cleanup_credentials init_credentials
 export -f remote_mysql local_mysql remote_mysqldump
 export -f sql_ident create_database_sql read_dump_options local_import_args
+export -f local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table

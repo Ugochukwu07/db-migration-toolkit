@@ -50,16 +50,13 @@ sync_database() {
         
         # Step 1: Dump database
         if sync_dump_database "$DB" "$BACKUP_DIR" "$TMP_DIR" "$TIMESTAMP" $attempt; then
-            # Step 2: Prepare local database
-            if sync_prepare_local_db "$DB" "$TMP_DIR" "$TIMESTAMP" $attempt; then
-                # Step 3: Import database
-                if sync_import_database "$DB" "$BACKUP_DIR" "$TMP_DIR" "$TIMESTAMP" $attempt; then
-                    local end_time=$(date +%s)
-                    local duration=$((end_time - start_time))
-                    thread_log "SUCCESS" "$DB" "Database synchronization completed successfully in ${duration}s (attempt $attempt/$max_attempts)"
-                    echo "SUCCESS:$DB:${duration}s:$attempt:$TIMESTAMP" >> "$TMP_DIR/sync_status-$TIMESTAMP.tmp"
-                    return 0
-                fi
+            # Step 2: Replace local database (snapshot + rollback on failure)
+            if sync_import_database "$DB" "$BACKUP_DIR" "$TMP_DIR" "$TIMESTAMP" $attempt; then
+                local end_time=$(date +%s)
+                local duration=$((end_time - start_time))
+                thread_log "SUCCESS" "$DB" "Database synchronization completed successfully in ${duration}s (attempt $attempt/$max_attempts)"
+                echo "SUCCESS:$DB:${duration}s:$attempt:$TIMESTAMP" >> "$TMP_DIR/sync_status-$TIMESTAMP.tmp"
+                return 0
             fi
         fi
         
@@ -88,7 +85,7 @@ sync_dump_database() {
     local error_file="$TMP_DIR/${DB}_dump_error-$TIMESTAMP.log"
     local backup_file="$BACKUP_DIR/${DB}-${TIMESTAMP}.sql"
     
-    thread_log "INFO" "$DB" "Step 1/3: Dumping $DB from remote server (attempt $attempt)..."
+    thread_log "INFO" "$DB" "Step 1/2: Dumping $DB from remote server (attempt $attempt)..."
     thread_log "INFO" "$DB" "Backup file: $backup_file"
     
     # Clear previous error log
@@ -123,45 +120,9 @@ sync_dump_database() {
     return 0
 }
 
-# === PREPARE LOCAL DATABASE FUNCTION ===
-sync_prepare_local_db() {
-    local DB="$1"
-    local TMP_DIR="$2"
-    local TIMESTAMP="$3"
-    local attempt="$4"
-    local error_file="$TMP_DIR/${DB}_prep_error-$TIMESTAMP.log"
-    
-    # Generate local database name using configuration
-    local LOCAL_DB_NAME=$(get_local_database_name "$DB")
-    
-    thread_log "INFO" "$DB" "Step 2/3: Preparing local database $LOCAL_DB_NAME (attempt $attempt)..."
-    
-    # Clear previous error log
-    > "$error_file"
-    
-    # Drop existing database
-    thread_log "INFO" "$DB" "Dropping existing local database $LOCAL_DB_NAME (if exists)..."
-    if ! local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$LOCAL_DB_NAME")" 2>"$error_file"; then
-        local error_msg=$(head -n 2 "$error_file" 2>/dev/null | tr '\n' ' ')
-        thread_log "ERROR" "$DB" "Failed to drop database (attempt $attempt): ${error_msg}"
-        echo "PREP_ERROR:$DB:attempt_$attempt:Drop failed - ${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-        return 1
-    fi
-    
-    # Create fresh database (charset/collation come from validated config)
-    thread_log "INFO" "$DB" "Creating fresh local database $LOCAL_DB_NAME..."
-    if ! local_mysql -e "$(create_database_sql "$LOCAL_DB_NAME")" 2>"$error_file"; then
-        local error_msg=$(head -n 2 "$error_file" 2>/dev/null | tr '\n' ' ')
-        thread_log "ERROR" "$DB" "Failed to create database (attempt $attempt): ${error_msg}"
-        echo "PREP_ERROR:$DB:attempt_$attempt:Create failed - ${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-        return 1
-    fi
-    
-    rm -f "$error_file"  # Clean up error file on success
-    return 0
-}
-
 # === IMPORT DATABASE FUNCTION ===
+# Replaces the local database from the dump. The existing local database is
+# snapshotted first and restored if the import or verification fails.
 sync_import_database() {
     local DB="$1"
     local BACKUP_DIR="$2"
@@ -170,37 +131,23 @@ sync_import_database() {
     local attempt="$5"
     local error_file="$TMP_DIR/${DB}_import_error-$TIMESTAMP.log"
     local backup_file="$BACKUP_DIR/${DB}-${TIMESTAMP}.sql"
-    
-    # Generate local database name using configuration
+    local safety_file="$BACKUP_DIR/pre-sync_${DB}-${TIMESTAMP}.sql"
     local LOCAL_DB_NAME=$(get_local_database_name "$DB")
     
-    thread_log "INFO" "$DB" "Step 3/3: Importing dump into local database $LOCAL_DB_NAME (attempt $attempt)..."
-    thread_log "INFO" "$DB" "Importing from: $backup_file"
+    thread_log "INFO" "$DB" "Step 2/2: Replacing local database $LOCAL_DB_NAME from $backup_file (attempt $attempt)..."
     
-    # Clear previous error log
-    > "$error_file"
-    
-    # Import dump into local DB
-    local -a import_args=()
-    local_import_args import_args
-    
-    if ! local_mysql "${import_args[@]}" "$LOCAL_DB_NAME" < "$backup_file" 2>"$error_file"; then
-        local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
-        thread_log "ERROR" "$DB" "Import failed (attempt $attempt): ${error_msg}"
+    replace_local_database "$LOCAL_DB_NAME" "$backup_file" "$safety_file" "$error_file"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        local error_msg=$(tail -n 4 "$error_file" 2>/dev/null | tr '\n' ' ')
+        thread_log "ERROR" "$DB" "Import failed (rc=$rc, attempt $attempt): ${error_msg}"
         echo "IMPORT_ERROR:$DB:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
-    # Verify import by checking if tables exist
     local table_count=$(local_mysql -N -B "$LOCAL_DB_NAME" -e 'SHOW TABLES;' 2>/dev/null | wc -l)
-    if [ "${table_count:-0}" -lt 1 ]; then
-        thread_log "ERROR" "$DB" "Import verification failed - no tables found (attempt $attempt)"
-        echo "IMPORT_ERROR:$DB:attempt_$attempt:No tables found after import:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-        return 1
-    fi
-    
     thread_log "SUCCESS" "$DB" "Database import completed successfully ($table_count tables, attempt $attempt)"
-    rm -f "$error_file"  # Clean up error file on success
+    rm -f -- "$error_file"
     return 0
 }
 
@@ -343,12 +290,14 @@ SYNC_END_TIME=$(date +%s)
 TOTAL_DURATION=$((SYNC_END_TIME - SYNC_START_TIME))
 
 # === FINAL REPORT ===
+successful=0
+failed=0
 log "INFO" "All database synchronization processes completed"
 log "INFO" "Total execution time: ${TOTAL_DURATION}s"
 
 if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
-    local successful=$(grep -c "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-    local failed=$(grep -c "^FAILED:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
+    successful=$(grep -c "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || true)
+    failed=$(grep -c "^FAILED:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || true)
     
     log "INFO" "FINAL SUMMARY:"
     log "INFO" "  ✓ Successful: $successful databases"
@@ -357,7 +306,7 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
     if [ "$successful" -gt 0 ]; then
         log "INFO" "Successfully synchronized databases:"
         grep "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" | while IFS=':' read -r status db duration attempt timestamp; do
-            local local_db_name=$(get_local_database_name "$db")
+            local_db_name=$(get_local_database_name "$db")
             if [ -n "$attempt" ]; then
                 log "INFO" "  - $db -> $local_db_name (completed in $duration, attempt $attempt) -> ${db}-${timestamp}.sql"
             else
@@ -376,9 +325,9 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
     # Show error summary if errors occurred
     if [ -f "$TMP_DIR/error_log-$TIMESTAMP.tmp" ]; then
         log "INFO" "Error Summary:"
-        local dump_errors=$(grep -c "^DUMP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-        local prep_errors=$(grep -c "^PREP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-        local import_errors=$(grep -c "^IMPORT_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
+        dump_errors=$(grep -c "^DUMP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
+        prep_errors=$(grep -c "^PREP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
+        import_errors=$(grep -c "^IMPORT_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
         
         log "INFO" "  - Dump errors: $dump_errors"
         log "INFO" "  - Preparation errors: $prep_errors"
@@ -404,7 +353,7 @@ fi
 
 # Send notifications if configured
 if [ "${ENABLE_EMAIL_NOTIFICATIONS:-false}" = "true" ] && command -v mail >/dev/null 2>&1; then
-    local status_msg="Multi-threaded database synchronization completed"
+    status_msg="Multi-threaded database synchronization completed"
     if [ "$failed" -gt 0 ]; then
         status_msg="$status_msg with $failed failures"
     fi
@@ -413,7 +362,7 @@ if [ "${ENABLE_EMAIL_NOTIFICATIONS:-false}" = "true" ] && command -v mail >/dev/
 fi
 
 if [ "${ENABLE_WEBHOOK_NOTIFICATIONS:-false}" = "true" ] && [ -n "${WEBHOOK_URL:-}" ] && command -v curl >/dev/null 2>&1; then
-    local webhook_data="{\"text\":\"Multi-threaded database synchronization completed. Success: $successful, Failed: $failed\"}"
+    webhook_data="{\"text\":\"Multi-threaded database synchronization completed. Success: $successful, Failed: $failed\"}"
     curl -X POST -H "Content-Type: application/json" \
          -d "$webhook_data" \
          "${WEBHOOK_URL}" >/dev/null 2>&1 || true
