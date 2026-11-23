@@ -875,11 +875,36 @@ report_tls_status() {
 }
 
 # Import a (possibly gzip-compressed) dump file; fails if either the
-# decompression or the mysql client fails. Usage: _import_backup <db> <file> <errfile> <import_args_array>
+# decompression or the mysql client fails.
+# With sanitize=true, GTID / replication statements are stripped and binary
+# logging is disabled for the session (for dumps taken elsewhere).
+# Usage: _import_backup <db> <file> <errfile> <import_args_array> [sanitize]
 _import_backup() {
     local db="$1" f="$2" err="$3"
     local -n _ib_args=$4
-    ( set -o pipefail; read_backup "$f" | local_mysql "${_ib_args[@]}" "$db" ) 2>>"$err"
+    local sanitize="${5:-false}"
+    if [ "$sanitize" = "true" ]; then
+        (
+            set -o pipefail
+            {
+                echo "SET SESSION sql_log_bin=0;"
+                read_backup "$f" | sed -e '/SET @@GLOBAL.GTID_PURGED/d' \
+                                       -e '/SET @@SESSION.SQL_LOG_BIN/d' \
+                                       -e '/SET @@GLOBAL.GTID_EXECUTED/d' \
+                                       -e '/CHANGE MASTER/d'
+            } | local_mysql "${_ib_args[@]}" "$db"
+        ) 2>>"$err"
+    else
+        ( set -o pipefail; read_backup "$f" | local_mysql "${_ib_args[@]}" "$db" ) 2>>"$err"
+    fi
+}
+
+# Does a dump contain statements that switch the target database
+# (CREATE DATABASE / USE, as written by mysqldump --databases)? Importing such a
+# file would write into whatever database it names, bypassing the target name
+# and the protected-schema guard.
+backup_switches_database() {
+    read_backup "$1" 2>/dev/null | grep -m1 -qiE '^[[:space:]]*(CREATE[[:space:]]+(DATABASE|SCHEMA)|USE[[:space:]]+[`"a-zA-Z0-9_])'
 }
 
 # === SAFE REPLACE HELPERS (no data loss on a failed import) ===
@@ -902,9 +927,9 @@ _discard_safety() {
 }
 
 # Replace a local database with the contents of a dump, rolling back on failure.
-# Usage: replace_local_database <local_db> <dump_file> <safety_file> <error_file>
+# Usage: replace_local_database <local_db> <dump_file> <safety_file> <error_file> [sanitize:true|false]
 replace_local_database() {
-    local db="${1:?}" dump_file="${2:?}" safety_file="${3:?}" err_file="${4:?}"
+    local db="${1:?}" dump_file="${2:?}" safety_file="${3:?}" err_file="${4:?}" sanitize="${5:-false}"
     local existed=0 found
     local -a import_args=()
     local_import_args import_args
@@ -933,7 +958,7 @@ replace_local_database() {
     local ok=1
     local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file" || ok=0
     [ $ok -eq 1 ] && { local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" || ok=0; }
-    [ $ok -eq 1 ] && { _import_backup "$db" "$dump_file" "$err_file" import_args || ok=0; }
+    [ $ok -eq 1 ] && { _import_backup "$db" "$dump_file" "$err_file" import_args "$sanitize" || ok=0; }
 
     # 3. Verify: if the dump defines tables, they must exist now
     if [ $ok -eq 1 ] && backup_has_text "$dump_file" "CREATE TABLE"; then
@@ -1038,5 +1063,5 @@ export -f should_drop_existing_tables
 export -f _cnf_escape _write_cnf cleanup_credentials init_credentials
 export -f remote_mysql local_mysql remote_mysqldump
 export -f sql_ident create_database_sql read_dump_options local_import_args
-export -f backup_ext dump_to_file read_backup backup_has_text backup_count_text cleanup_old_backups secure_dirs remote_bytes local_bytes check_disk_space check_disk_for_databases check_disk_for_tables report_tls_status _import_backup local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table
+export -f backup_switches_database backup_ext dump_to_file read_backup backup_has_text backup_count_text cleanup_old_backups secure_dirs remote_bytes local_bytes check_disk_space check_disk_for_databases check_disk_for_tables report_tls_status _import_backup local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table
 export -f print_safety_usage parse_safety_args is_protected_database servers_are_same guard_plan local_db_exists confirm_plan plan_and_confirm_databases plan_and_confirm_tables

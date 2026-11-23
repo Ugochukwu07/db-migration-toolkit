@@ -230,6 +230,94 @@ check "no plaintext temp files left in the backup dir" bash -c "! ls '$P'/backup
 lq 'DROP DATABASE IF EXISTS imported_other_db; DROP DATABASE IF EXISTS imported_plain_copy' >/dev/null 2>&1
 
 # =============================================================================
+CURRENT="import_from_backups: rollback and safety"; echo; echo "== $CURRENT =="
+drop_imported() {
+    local d
+    for d in imported_other_db imported_rb_src imported_trunc_db imported_ok_db imported_gtid_db imported_good_db imported_plain_copy "imported_pre-sync_x" other_target; do
+        lq "DROP DATABASE IF EXISTS \`$d\`" >/dev/null 2>&1
+    done
+}
+no_snapshots() { bash -c "! ls '$P'/data/tmp/import_from_backups/pre-import_* >/dev/null 2>&1"; }
+drop_imported
+
+# --- an existing database is replaced, not merged
+new_project 'IMPORT_BACKUP_DIR=backups'; mkdir -p "$P/backups"
+cp "$WORK/other_db.sql.gz" "$P/backups/other_db.sql.gz"
+lq "CREATE DATABASE imported_other_db; CREATE TABLE imported_other_db.stray (id INT)" >/dev/null
+run_tool import_from_backups.sh; rc=$?
+eq "replacing an existing database: exit code 0" 0 "$rc"
+assert_same_tables other_db imported_other_db
+eq "stray table from the old copy is gone" 0 "$(lq "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='imported_other_db' AND table_name='stray'")"
+check "snapshot removed after success" no_snapshots
+eq "snapshot directory mode" 700 "$(stat -c %a "$P/data/tmp/import_from_backups")"
+check "no snapshot written into the backup directory" bash -c "! ls '$P'/backups/pre-* >/dev/null 2>&1"
+drop_imported
+
+# --- a dump that cannot be imported must not destroy the existing database
+new_project 'SYNC_DATABASES="rb_src"'
+run_tool sync_databases.sh >/dev/null                      # produces data/backups/rb_src.sql.gz (with the 2 MiB row)
+cp "$P/data/backups/rb_src.sql.gz" "$WORK/rb_src.sql.gz"
+lq 'DROP DATABASE IF EXISTS local_rb_src' >/dev/null
+lq "CREATE DATABASE imported_rb_src; CREATE TABLE imported_rb_src.sentinel (id INT PRIMARY KEY, v VARCHAR(20)); INSERT INTO imported_rb_src.sentinel VALUES (1,'precious')" >/dev/null
+new_project 'IMPORT_BACKUP_DIR=backups'; mkdir -p "$P/backups"
+cp "$WORK/rb_src.sql.gz" "$P/backups/rb_src.sql.gz"
+OLD_PACKET="$(lq 'SELECT @@global.max_allowed_packet')"
+lq "SET GLOBAL max_allowed_packet=1048576" >/dev/null
+run_tool import_from_backups.sh; rc=$?
+lq "SET GLOBAL max_allowed_packet=$OLD_PACKET" >/dev/null
+check "failed import: non-zero exit" test "$rc" -ne 0
+check "failed import is reported" log_has "Failed to import rb_src"
+check "rollback is reported" log_has "Rolled back"
+eq "original data restored" "precious" "$(lq 'SELECT v FROM imported_rb_src.sentinel WHERE id=1')"
+eq "failed import left no new tables" 1 "$(lq "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='imported_rb_src'")"
+check "snapshot removed after rollback" no_snapshots
+drop_imported
+
+# --- truncated / corrupt gzip is detected and does not destroy anything;
+#     the remaining files are still imported
+new_project 'IMPORT_BACKUP_DIR=backups'; mkdir -p "$P/backups"
+head -c 100 "$WORK/other_db.sql.gz" > "$P/backups/trunc_db.sql.gz"
+cp "$WORK/other_db.sql.gz" "$P/backups/ok_db.sql.gz"
+lq "CREATE DATABASE imported_trunc_db; CREATE TABLE imported_trunc_db.sentinel (id INT PRIMARY KEY, v VARCHAR(20)); INSERT INTO imported_trunc_db.sentinel VALUES (1,'still-here')" >/dev/null
+run_tool import_from_backups.sh; rc=$?
+check "truncated backup: non-zero exit" test "$rc" -ne 0
+check "truncated backup reported" log_has "Failed to import trunc_db"
+eq "existing database kept" "still-here" "$(lq 'SELECT v FROM imported_trunc_db.sentinel WHERE id=1')"
+assert_same_tables other_db imported_ok_db
+drop_imported
+
+# --- GTID / replication statements from other servers are stripped
+new_project 'IMPORT_BACKUP_DIR=backups'; mkdir -p "$P/backups"
+printf "SET @@GLOBAL.GTID_PURGED='+8e7f1f0a-0000-0000-0000-000000000000:1-5';\nCREATE TABLE t (id INT PRIMARY KEY);\nINSERT INTO t VALUES (1);\n" > "$P/backups/gtid_db.sql"
+run_tool import_from_backups.sh; rc=$?
+eq "dump with GTID_PURGED imports" 0 "$rc"
+eq "its data arrived" 1 "$(lq 'SELECT COUNT(*) FROM imported_gtid_db.t')"
+drop_imported
+
+# --- dumps that switch database are refused before anything runs
+new_project 'IMPORT_BACKUP_DIR=backups'; mkdir -p "$P/backups"
+printf 'CREATE TABLE good_t (id INT);\n' > "$P/backups/good_db.sql"
+printf 'USE `mysql`;\nCREATE TABLE evil_t (id INT);\n' > "$P/backups/sneaky.sql"
+printf 'CREATE DATABASE other_target;\nCREATE TABLE t (id INT);\n' > "$P/backups/sneaky2.sql"
+run_tool import_from_backups.sh; rc=$?
+check "USE / CREATE DATABASE dumps: non-zero exit" test "$rc" -ne 0
+check "USE dump is named in the error" log_has "sneaky.sql contains"
+check "CREATE DATABASE dump is named in the error" log_has "sneaky2.sql contains"
+eq "nothing written into the mysql schema" 0 "$(lq "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='mysql' AND table_name='evil_t'")"
+eq "no stray database created" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='other_target'")"
+eq "the good file was not imported either (whole run refused)" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='imported_good_db'")"
+drop_imported
+
+# --- leftover snapshots are never treated as backups
+new_project 'IMPORT_BACKUP_DIR=backups'; mkdir -p "$P/backups"
+cp "$WORK/other_db.sql.gz" "$P/backups/pre-sync_x.sql.gz"
+cp "$WORK/other_db.sql.gz" "$P/backups/other_db.sql.gz"
+run_tool import_from_backups.sh; rc=$?
+eq "exit code 0" 0 "$rc"
+eq "pre-sync_* file ignored" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='imported_pre-sync_x'")"
+drop_imported
+
+# =============================================================================
 CURRENT="disk space check"; echo; echo "== $CURRENT =="
 reset_local
 new_project 'SYNC_DATABASES="other_db"' 'MIN_FREE_DISK_MB=999999999'

@@ -34,84 +34,84 @@ if [ ! -d "$BACKUP_DIR" ]; then
     exit 1
 fi
 
-# Safety guards + plan + confirmation (before any database is dropped).
+# Where pre-import snapshots live. This is deliberately NOT the backup directory
+# being imported, so a snapshot can never be picked up as a backup to import.
+SAFETY_DIR="${PROJECT_ROOT}/data/tmp/import_from_backups"
+mkdir -p "$SAFETY_DIR"
+secure_dirs "$SAFETY_DIR"
+
+# Safety guards + plan + confirmation (before any database is replaced).
 # There is no remote source here, so only the protected-schema rule applies.
-declare -a IMPORT_SRC=() IMPORT_DST=() IMPORT_PLAN=() IMPORT_FILES=()
+declare -a IMPORT_SRC=() IMPORT_DST=() IMPORT_PLAN=() IMPORT_FILES=() IMPORT_PATHS=()
 IMPORT_FAILED=0
 for SQL_FILE in "$BACKUP_DIR"/*.sql "$BACKUP_DIR"/*.sql.gz; do
     [ -f "$SQL_FILE" ] || continue
     n=$(basename "$SQL_FILE"); n="${n%.gz}"; n="${n%.sql}"
-    IMPORT_SRC+=("$n"); IMPORT_DST+=("$LOCAL_DB_PREFIX$n"); IMPORT_FILES+=("$(basename "$SQL_FILE")")
+    case "$n" in pre-sync_*|pre-import_*) continue ;; esac   # leftover snapshots are never imported
+    IMPORT_SRC+=("$n"); IMPORT_DST+=("$LOCAL_DB_PREFIX$n"); IMPORT_FILES+=("$(basename "$SQL_FILE")"); IMPORT_PATHS+=("$SQL_FILE")
 done
 if [ ${#IMPORT_SRC[@]} -eq 0 ]; then
     echo "No .sql or .sql.gz files found in $BACKUP_DIR"
     exit 1
 fi
 guard_plan IMPORT_SRC IMPORT_DST true || { echo "Safety checks failed. Nothing was changed."; exit 1; }
+
+# A dump that switches database (CREATE DATABASE / USE) would write somewhere
+# other than the planned target, bypassing the checks above.
+SWITCHING=0
+for i in "${!IMPORT_PATHS[@]}"; do
+    if backup_switches_database "${IMPORT_PATHS[$i]}"; then
+        echo "ERROR: ${IMPORT_FILES[$i]} contains CREATE DATABASE / USE statements (a mysqldump --databases dump)."
+        echo "       It would write into the database it names instead of ${IMPORT_DST[$i]}. Re-create it without --databases."
+        SWITCHING=1
+    fi
+done
+[ "$SWITCHING" -eq 0 ] || { echo "Safety checks failed. Nothing was changed."; exit 1; }
+
+LOCAL_BYTES=0
 for i in "${!IMPORT_SRC[@]}"; do
     if local_db_exists "${IMPORT_DST[$i]}"; then
-        IMPORT_PLAN+=("${IMPORT_FILES[$i]} -> ${IMPORT_DST[$i]}   [EXISTS: dropped and replaced]")
+        IMPORT_PLAN+=("${IMPORT_FILES[$i]} -> ${IMPORT_DST[$i]}   [EXISTS: replaced; snapshot restored on failure]")
+        LOCAL_BYTES=$(( LOCAL_BYTES + $(local_bytes "${IMPORT_DST[$i]}") ))
     else
         IMPORT_PLAN+=("${IMPORT_FILES[$i]} -> ${IMPORT_DST[$i]}   [new]")
     fi
 done
 confirm_plan IMPORT_PLAN
+check_disk_space "$SAFETY_DIR" 0 "$LOCAL_BYTES" || exit 1
 
 echo "Starting import from $BACKUP_DIR..."
 echo "Local database prefix: $LOCAL_DB_PREFIX"
 echo "Target host: ${LOCAL_HOST:-localhost}:${LOCAL_PORT:-3306}"
 
-for SQL_FILE in "$BACKUP_DIR"/*.sql "$BACKUP_DIR"/*.sql.gz; do
-    if [ ! -f "$SQL_FILE" ]; then
-        continue # Skip if not a file (e.g. if no dump files found)
-    fi
+for i in "${!IMPORT_PATHS[@]}"; do
+    SQL_FILE="${IMPORT_PATHS[$i]}"
+    DB_NAME="${IMPORT_SRC[$i]}"
+    LOCAL_DB_NAME="${IMPORT_DST[$i]}"
+    SAFETY_FILE="$SAFETY_DIR/pre-import_${LOCAL_DB_NAME}-$(date '+%Y%m%d_%H%M%S')$(backup_ext)"
+    ERR_FILE="$SAFETY_DIR/${LOCAL_DB_NAME}_import_error.log"
 
-    DB_NAME_WITH_EXT=$(basename "$SQL_FILE")
-    DB_NAME="${DB_NAME_WITH_EXT%.gz}"
-    DB_NAME="${DB_NAME%.sql}"
-    LOCAL_DB_NAME="$LOCAL_DB_PREFIX$DB_NAME"
+    echo "Importing $DB_NAME into local database $LOCAL_DB_NAME (existing data is snapshotted and restored on failure)..."
 
-    echo "Processing $DB_NAME..."
-    echo "Importing $DB_NAME into local database $LOCAL_DB_NAME..."
+    # Snapshot, replace, verify; restore the snapshot if anything fails.
+    replace_local_database "$LOCAL_DB_NAME" "$SQL_FILE" "$SAFETY_FILE" "$ERR_FILE" true
+    rc=$?
 
-    if ! local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$LOCAL_DB_NAME")"; then
-        echo "❌ Failed to drop existing database $LOCAL_DB_NAME"
-        continue
-    fi
-
-    if ! local_mysql -e "$(create_database_sql "$LOCAL_DB_NAME")"; then
-        echo "❌ Failed to create local database $LOCAL_DB_NAME"
-        continue
-    fi
-
-    # Stream the dump straight into mysql (no plaintext copy on disk): disable
-    # binary logging and FK checks, strip GTID / replication statements.
-    (
-        set -o pipefail
-        {
-            echo "SET SESSION sql_log_bin=0;"
-            echo "SET SESSION foreign_key_checks=0;"
-            if [ -n "${SQL_MODE:-}" ]; then echo "SET SESSION sql_mode='${SQL_MODE//\'/\'\'}';"; fi
-            read_backup "$SQL_FILE" | sed -e '/SET @@GLOBAL.GTID_PURGED/d' \
-                                          -e '/SET @@SESSION.SQL_LOG_BIN/d' \
-                                          -e '/SET @@GLOBAL.GTID_EXECUTED/d' \
-                                          -e '/CHANGE MASTER/d'
-            echo "SET SESSION sql_log_bin=1;"
-        } | local_mysql "$LOCAL_DB_NAME"
-    )
-    IMPORT_STATUS=$?
-
-    if [ $IMPORT_STATUS -ne 0 ]; then
-        echo "❌ Failed to import $DB_NAME into $LOCAL_DB_NAME"
-        IMPORT_FAILED=1
-    else
+    if [ $rc -eq 0 ]; then
         echo "✅ $DB_NAME imported into $LOCAL_DB_NAME successfully."
-        
-        # Verify import by counting tables
         table_count=$(local_mysql -N -B "$LOCAL_DB_NAME" -e 'SHOW TABLES;' 2>/dev/null | wc -l)
         if [ "${table_count:-0}" -gt 0 ]; then
             echo "   Import verified: $table_count tables found"
         fi
+        rm -f -- "${ERR_FILE:?}"
+    else
+        case $rc in
+            2) echo "❌ Aborted $DB_NAME: could not snapshot existing $LOCAL_DB_NAME; it was left untouched" ;;
+            3) echo "❌ Import of $DB_NAME failed AND rollback failed. Previous data is kept in $SAFETY_FILE" ;;
+            *) echo "❌ Failed to import $DB_NAME into $LOCAL_DB_NAME" ;;
+        esac
+        echo "   Details: $(tail -n 4 "$ERR_FILE" 2>/dev/null | tr '\n' ' ')"
+        IMPORT_FAILED=1
     fi
 done
 

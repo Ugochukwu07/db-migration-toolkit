@@ -495,3 +495,23 @@ tables), so they are treated as secrets:
 Dumps are not encrypted at rest. If the backup directory is on shared or
 unencrypted storage, put it on an encrypted volume or delete dumps after use
 (`BACKUP_RETENTION_DAYS`).
+
+## Importing backups safely
+
+`scripts/import_from_backups.sh` imports every `*.sql` / `*.sql.gz` file in
+`IMPORT_BACKUP_DIR` into `IMPORT_LOCAL_DB_PREFIX` + file name (default prefix
+`imported_`). It uses the same replace-with-rollback logic as the sync scripts:
+
+- If the target database already exists it is **snapshotted first** (into
+  `data/tmp/import_from_backups/`, never into the directory being imported) and
+  **restored if the import fails**, including a truncated or corrupt `.gz`.
+  A failure in one file does not stop the others; the script exits non-zero.
+- GTID and replication statements (`SET @@GLOBAL.GTID_PURGED`, `CHANGE MASTER`,
+  ...) are stripped, and binary logging is disabled for the import session.
+- Dumps containing `CREATE DATABASE` or `USE` (written by `mysqldump
+  --databases`) are **refused** before anything runs, because they would write
+  into the database they name instead of the planned target. Re-create such a
+  dump without `--databases`.
+- Leftover `pre-sync_*` / `pre-import_*` snapshot files are never imported.
+- `--dry-run`, `--yes` and the protected-schema checks apply as for the sync
+  scripts.
