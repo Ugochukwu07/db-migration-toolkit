@@ -28,8 +28,8 @@ if [ -n "$sync_processes" ]; then
     
     # Show backup file status
     echo -e "${YELLOW}📁 Current backup files:${NC}"
-    if ls ./backups/*.sql >/dev/null 2>&1; then
-        ls -lah ./backups/*.sql | grep -v test_ | while read -r line; do
+    if ls ./backups/*.sql* >/dev/null 2>&1; then
+        ls -lah ./backups/*.sql* | grep -v test_ | while read -r line; do
             size=$(echo "$line" | awk '{print $5}')
             name=$(echo "$line" | awk '{print $9}' | xargs basename)
             time=$(echo "$line" | awk '{print $6 " " $7 " " $8}')
@@ -51,7 +51,7 @@ else
     echo -e "${YELLOW}💤 NO SYNC RUNNING${NC}"
     
     # Check if there are recent backup files
-    recent_backups=$(find ./backups -name "*.sql" -not -name "test_*" -mmin -30 2>/dev/null)
+    recent_backups=$(find ./backups -name "*.sql*" -not -name "test_*" -mmin -30 2>/dev/null)
     if [ -n "$recent_backups" ]; then
         echo -e "${BLUE}📁 Recent backups (last 30 mins):${NC}"
         echo "$recent_backups" | while read -r file; do

@@ -81,7 +81,7 @@ show_backup_status() {
     if [ -d "$BACKUP_DIR" ]; then
         # Show files for current session if available
         if [ -n "$SESSION_TIMESTAMP" ]; then
-            local session_files=$(find "$BACKUP_DIR" -name "*-${SESSION_TIMESTAMP}.sql" 2>/dev/null)
+            local session_files=$(find "$BACKUP_DIR" -name "*-${SESSION_TIMESTAMP}.sql*" 2>/dev/null)
             if [ -n "$session_files" ]; then
                 echo -e "${CYAN}Current session files:${NC}"
                 echo "$session_files" | while read -r file; do
@@ -106,7 +106,7 @@ show_backup_status() {
             fi
         else
             # Show recent files if no specific session
-            local recent_files=$(find "$BACKUP_DIR" -name "*.sql" -mmin -60 2>/dev/null | head -10)
+            local recent_files=$(find "$BACKUP_DIR" -name "*.sql*" -mmin -60 2>/dev/null | head -10)
             if [ -n "$recent_files" ]; then
                 echo -e "${CYAN}Recent backup files (last hour):${NC}"
                 echo "$recent_files" | while read -r file; do
@@ -175,9 +175,9 @@ show_sync_status() {
             echo -e "${GREEN}Successful databases:${NC}"
             grep "^SUCCESS:" "$status_file" | while IFS=':' read -r status db duration attempt timestamp; do
                 if [ -n "$attempt" ]; then
-                    echo -e "  ${GREEN}✓${NC} $db ($duration, attempt $attempt) -> ${db}-${timestamp}.sql"
+                    echo -e "  ${GREEN}✓${NC} $db ($duration, attempt $attempt) -> ${db}-${timestamp}.sql*"
                 else
-                    echo -e "  ${GREEN}✓${NC} $db ($duration) -> ${db}-${timestamp}.sql"
+                    echo -e "  ${GREEN}✓${NC} $db ($duration) -> ${db}-${timestamp}.sql*"
                 fi
             done
         fi

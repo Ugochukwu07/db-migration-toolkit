@@ -48,6 +48,8 @@ plan_and_confirm_databases DATABASES
 # Create backup directory from configuration
 BACKUP_DIR="${PROJECT_ROOT}/${BACKUP_DIR:-data/backups}"
 mkdir -p "$BACKUP_DIR"
+secure_dirs "$BACKUP_DIR"
+check_disk_for_databases "$BACKUP_DIR" DATABASES || exit 1
 
 log "INFO" "Starting database synchronization process..."
 log "INFO" "Remote host: ${REMOTE_HOST}:${REMOTE_PORT:-3306}"
@@ -68,33 +70,35 @@ for DB in "${DATABASES[@]}"; do
     # Generate local database name
     LOCAL_DB_NAME=$(get_local_database_name "$DB")
     
+    DUMP_FILE="$BACKUP_DIR/$DB$(backup_ext)"
     if is_debug_mode; then
-        log "DEBUG" "Dump command: mysqldump [remote connection] --single-transaction ${DUMP_OPTS[*]} $DB > \"$BACKUP_DIR/$DB.sql\""
+        log "DEBUG" "Dump command: mysqldump [remote connection] --single-transaction ${DUMP_OPTS[*]} $DB > \"$DUMP_FILE\""
     fi
     
-    # Dump from remote DB with configured options
-    remote_mysqldump --single-transaction "${DUMP_OPTS[@]}" "$DB" > "$BACKUP_DIR/$DB.sql" 2>"$BACKUP_DIR/${DB}_dump_error.log"
+    # Dump from remote DB with configured options (compressed + private)
+    dump_to_file "$DUMP_FILE" "$BACKUP_DIR/${DB}_dump_error.log" remote_mysqldump --single-transaction "${DUMP_OPTS[@]}" "$DB"
 
     if [ $? -ne 0 ]; then
         log "ERROR" "Failed to dump database $DB from remote server"
         if [ -f "$BACKUP_DIR/${DB}_dump_error.log" ]; then
             log "ERROR" "Error details: $(head -n 3 "$BACKUP_DIR/${DB}_dump_error.log" | tr '\n' ' ')"
         fi
+        rm -f -- "$DUMP_FILE"
         log "WARN" "Skipping $DB and continuing with next database"
         FAILED_DBS+=("$DB")
         continue
     fi
 
-    dump_size=$(du -h "$BACKUP_DIR/$DB.sql" | cut -f1)
+    dump_size=$(du -h "$DUMP_FILE" | cut -f1)
     log "SUCCESS" "Database dump completed successfully (Size: $dump_size)"
     
     # Clean up successful dump error log
     rm -f "$BACKUP_DIR/${DB}_dump_error.log"
     
     log "INFO" "Step 2/3: Replacing local database $LOCAL_DB_NAME (existing data is snapshotted and restored on failure)..."
-    SAFETY_FILE="$BACKUP_DIR/pre-sync_${DB}-$(date '+%Y%m%d_%H%M%S').sql"
+    SAFETY_FILE="$BACKUP_DIR/pre-sync_${DB}-$(date '+%Y%m%d_%H%M%S')$(backup_ext)"
     IMPORT_ERR="$BACKUP_DIR/${DB}_import_error.log"
-    replace_local_database "$LOCAL_DB_NAME" "$BACKUP_DIR/$DB.sql" "$SAFETY_FILE" "$IMPORT_ERR"
+    replace_local_database "$LOCAL_DB_NAME" "$DUMP_FILE" "$SAFETY_FILE" "$IMPORT_ERR"
     rc=$?
     
     if [ $rc -eq 0 ]; then
@@ -125,7 +129,7 @@ log "INFO" "Backup files location: $BACKUP_DIR"
 # Clean up old backups if retention policy is set
 if [ -n "${BACKUP_RETENTION_DAYS:-}" ] && [ "${BACKUP_RETENTION_DAYS}" -gt 0 ]; then
     log "INFO" "Cleaning up backups older than ${BACKUP_RETENTION_DAYS} days"
-    find "$BACKUP_DIR" -name "*.sql" -mtime +${BACKUP_RETENTION_DAYS} -delete 2>/dev/null || true
+    cleanup_old_backups "$BACKUP_DIR" "${BACKUP_RETENTION_DAYS}"
     log "INFO" "Backup cleanup completed"
 fi
 

@@ -465,3 +465,33 @@ pass `--yes`**:
 
 `run_with_monitor.sh` shows the plan and asks in the foreground, then starts
 the sync in the background.
+
+## Securing dumps
+
+Dump files contain your database contents (and often credentials stored in
+tables), so they are treated as secrets:
+
+- **Private by default.** All files the toolkit writes are mode `600` and its
+  directories `700` (`umask 077`). Dumps, logs and temp files left behind by an
+  older version are tightened on the next run. `config.env` holds passwords: a
+  warning is printed if other users can read it (`chmod 600 config/config.env`).
+- **Compressed.** Dumps are written as `*.sql.gz` (integrity-checked with
+  `gzip -t`). Set `BACKUP_COMPRESSION="none"` for plain `.sql`. A failure in
+  either `mysqldump` or `gzip` fails the dump and removes the partial file.
+  Imports, safety snapshots, retention cleanup and `import_from_backups.sh` all
+  understand both formats.
+- **Disk space check.** Before the first dump the toolkit estimates the space
+  needed (new dumps plus the safety snapshots of what will be replaced) and
+  refuses to start if it would not fit, keeping `MIN_FREE_DISK_MB` (default 200)
+  free. Disable with `DISK_SPACE_CHECK="false"`.
+- **Encrypted connection.** `REMOTE_SSL_MODE` (and `LOCAL_SSL_MODE`) accept
+  `DISABLED`, `PREFERRED`, `REQUIRED`, `VERIFY_CA` and `VERIFY_IDENTITY`;
+  `VERIFY_CA` needs `REMOTE_SSL_CA`. On every run the toolkit reports whether
+  each connection is actually encrypted and warns loudly when the remote is not
+  on this machine and the link is in clear text. The example config sets
+  `REMOTE_SSL_MODE="REQUIRED"`. MariaDB clients do not support `ssl-mode`;
+  leave it unset there.
+
+Dumps are not encrypted at rest. If the backup directory is on shared or
+unencrypted storage, put it on an encrypted volume or delete dumps after use
+(`BACKUP_RETENTION_DAYS`).

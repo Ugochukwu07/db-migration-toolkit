@@ -36,22 +36,23 @@ fi
 
 # Safety guards + plan + confirmation (before any database is dropped).
 # There is no remote source here, so only the protected-schema rule applies.
-declare -a IMPORT_SRC=() IMPORT_DST=() IMPORT_PLAN=()
-for SQL_FILE in "$BACKUP_DIR"/*.sql; do
+declare -a IMPORT_SRC=() IMPORT_DST=() IMPORT_PLAN=() IMPORT_FILES=()
+IMPORT_FAILED=0
+for SQL_FILE in "$BACKUP_DIR"/*.sql "$BACKUP_DIR"/*.sql.gz; do
     [ -f "$SQL_FILE" ] || continue
-    n=$(basename "$SQL_FILE" .sql)
-    IMPORT_SRC+=("$n"); IMPORT_DST+=("$LOCAL_DB_PREFIX$n")
+    n=$(basename "$SQL_FILE"); n="${n%.gz}"; n="${n%.sql}"
+    IMPORT_SRC+=("$n"); IMPORT_DST+=("$LOCAL_DB_PREFIX$n"); IMPORT_FILES+=("$(basename "$SQL_FILE")")
 done
 if [ ${#IMPORT_SRC[@]} -eq 0 ]; then
-    echo "No .sql files found in $BACKUP_DIR"
+    echo "No .sql or .sql.gz files found in $BACKUP_DIR"
     exit 1
 fi
 guard_plan IMPORT_SRC IMPORT_DST true || { echo "Safety checks failed. Nothing was changed."; exit 1; }
 for i in "${!IMPORT_SRC[@]}"; do
     if local_db_exists "${IMPORT_DST[$i]}"; then
-        IMPORT_PLAN+=("${IMPORT_SRC[$i]}.sql -> ${IMPORT_DST[$i]}   [EXISTS: dropped and replaced]")
+        IMPORT_PLAN+=("${IMPORT_FILES[$i]} -> ${IMPORT_DST[$i]}   [EXISTS: dropped and replaced]")
     else
-        IMPORT_PLAN+=("${IMPORT_SRC[$i]}.sql -> ${IMPORT_DST[$i]}   [new]")
+        IMPORT_PLAN+=("${IMPORT_FILES[$i]} -> ${IMPORT_DST[$i]}   [new]")
     fi
 done
 confirm_plan IMPORT_PLAN
@@ -60,61 +61,49 @@ echo "Starting import from $BACKUP_DIR..."
 echo "Local database prefix: $LOCAL_DB_PREFIX"
 echo "Target host: ${LOCAL_HOST:-localhost}:${LOCAL_PORT:-3306}"
 
-for SQL_FILE in "$BACKUP_DIR"/*.sql; do
+for SQL_FILE in "$BACKUP_DIR"/*.sql "$BACKUP_DIR"/*.sql.gz; do
     if [ ! -f "$SQL_FILE" ]; then
-        continue # Skip if not a file (e.g. if no .sql files found)
+        continue # Skip if not a file (e.g. if no dump files found)
     fi
 
     DB_NAME_WITH_EXT=$(basename "$SQL_FILE")
-    DB_NAME="${DB_NAME_WITH_EXT%.sql}"
+    DB_NAME="${DB_NAME_WITH_EXT%.gz}"
+    DB_NAME="${DB_NAME%.sql}"
     LOCAL_DB_NAME="$LOCAL_DB_PREFIX$DB_NAME"
 
     echo "Processing $DB_NAME..."
-
-    TEMP_SQL_FILE="${SQL_FILE}.tmp"
-    cp "$SQL_FILE" "$TEMP_SQL_FILE"
-
-    # Remove GTID and replication related commands
-    sed -i '/SET @@GLOBAL.GTID_PURGED/d' "$TEMP_SQL_FILE"
-    sed -i '/SET @@SESSION.SQL_LOG_BIN/d' "$TEMP_SQL_FILE"
-    sed -i '/SET @@GLOBAL.GTID_EXECUTED/d' "$TEMP_SQL_FILE"
-    sed -i '/CHANGE MASTER/d' "$TEMP_SQL_FILE"
-
     echo "Importing $DB_NAME into local database $LOCAL_DB_NAME..."
 
     if ! local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$LOCAL_DB_NAME")"; then
         echo "❌ Failed to drop existing database $LOCAL_DB_NAME"
-        rm "$TEMP_SQL_FILE"
         continue
     fi
 
     if ! local_mysql -e "$(create_database_sql "$LOCAL_DB_NAME")"; then
         echo "❌ Failed to create local database $LOCAL_DB_NAME"
-        rm "$TEMP_SQL_FILE"
         continue
     fi
 
-    # Create a temporary wrapper SQL file that disables binary logging
-    WRAPPER_SQL_FILE="${TEMP_SQL_FILE}.wrapper"
-    echo "SET SESSION sql_log_bin=0;" > "$WRAPPER_SQL_FILE"
-    echo "SET SESSION foreign_key_checks=0;" >> "$WRAPPER_SQL_FILE"
-    
-    # Set SQL mode if configured
-    if [ -n "${SQL_MODE:-}" ]; then
-        echo "SET SESSION sql_mode='${SQL_MODE}';" >> "$WRAPPER_SQL_FILE"
-    fi
-    
-    cat "$TEMP_SQL_FILE" >> "$WRAPPER_SQL_FILE"
-    echo "SET SESSION sql_log_bin=1;" >> "$WRAPPER_SQL_FILE"
-
-    # Import dump into local DB
-    local_mysql "$LOCAL_DB_NAME" < "$WRAPPER_SQL_FILE"
+    # Stream the dump straight into mysql (no plaintext copy on disk): disable
+    # binary logging and FK checks, strip GTID / replication statements.
+    (
+        set -o pipefail
+        {
+            echo "SET SESSION sql_log_bin=0;"
+            echo "SET SESSION foreign_key_checks=0;"
+            if [ -n "${SQL_MODE:-}" ]; then echo "SET SESSION sql_mode='${SQL_MODE//\'/\'\'}';"; fi
+            read_backup "$SQL_FILE" | sed -e '/SET @@GLOBAL.GTID_PURGED/d' \
+                                          -e '/SET @@SESSION.SQL_LOG_BIN/d' \
+                                          -e '/SET @@GLOBAL.GTID_EXECUTED/d' \
+                                          -e '/CHANGE MASTER/d'
+            echo "SET SESSION sql_log_bin=1;"
+        } | local_mysql "$LOCAL_DB_NAME"
+    )
     IMPORT_STATUS=$?
-
-    rm "$TEMP_SQL_FILE" "$WRAPPER_SQL_FILE"
 
     if [ $IMPORT_STATUS -ne 0 ]; then
         echo "❌ Failed to import $DB_NAME into $LOCAL_DB_NAME"
+        IMPORT_FAILED=1
     else
         echo "✅ $DB_NAME imported into $LOCAL_DB_NAME successfully."
         
@@ -140,4 +129,9 @@ if [ "${ENABLE_WEBHOOK_NOTIFICATIONS:-false}" = "true" ] && [ -n "${WEBHOOK_URL:
     curl -X POST -H "Content-Type: application/json" \
          -d '{"text":"Database backup import process completed successfully"}' \
          "${WEBHOOK_URL}" >/dev/null 2>&1 || true
+fi
+
+if [ "$IMPORT_FAILED" -ne 0 ]; then
+    echo "One or more imports failed."
+    exit 1
 fi

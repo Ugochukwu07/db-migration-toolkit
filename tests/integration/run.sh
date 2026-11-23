@@ -59,6 +59,10 @@ new_project() { # new_project <extra config lines...>
         echo 'TEST_CONNECTIONS=true'
         for l in "$@"; do echo "$l"; done
     } > "$P/config/config.env"
+    chmod 600 "$P/config/config.env"
+}
+loose_perms() { # files not 600 / directories not 700 under a path
+    find "$1" \( -type f ! -perm 600 \) -o \( -type d ! -perm 700 \) 2>/dev/null
 }
 run_tool() { # run_tool <script> [args]  (always --yes; output in $P/out.log, status returned)
     local script="$1"; shift
@@ -151,6 +155,133 @@ eq "exit code 0" 0 "$rc"
 assert_same_tables app_db rb_target customers orders select
 assert_same_tables other_db local_other_db t1 t2
 eq "only requested tables copied" 3 "$(lq "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='rb_target'")"
+
+# =============================================================================
+# DUMP SECURITY
+# =============================================================================
+CURRENT="dumps: gzip + private files"; echo; echo "== $CURRENT =="
+reset_local
+new_project 'SYNC_DATABASES="other_db"' 'BACKUP_RETENTION_DAYS=3'
+mkdir -p "$P/data" "$P/data/backups"; chmod 700 "$P/data"; chmod 755 "$P/data/backups"
+touch "$P/data/backups/legacy.sql"; chmod 644 "$P/data/backups/legacy.sql"          # left by an older version
+touch -d '10 days ago' "$P/data/backups/ancient.sql.gz"
+run_tool sync_databases.sh; rc=$?
+eq "exit code 0" 0 "$rc"
+check "dump is stored as .sql.gz" test -f "$P/data/backups/other_db.sql.gz"
+check "dump is a valid gzip file" gzip -t "$P/data/backups/other_db.sql.gz"
+check "dump decompresses to SQL" bash -c "zcat '$P/data/backups/other_db.sql.gz' | grep -q 'CREATE TABLE'"
+check "no uncompressed copy left behind" bash -c "! ls '$P'/data/backups/other_db.sql >/dev/null 2>&1"
+eq "dump file mode" 600 "$(stat -c %a "$P/data/backups/other_db.sql.gz")"
+eq "backup directory mode" 700 "$(stat -c %a "$P/data/backups")"
+eq "legacy world-readable dump tightened" 600 "$(stat -c %a "$P/data/backups/legacy.sql")"
+eq "nothing under data/ is group/world accessible" "" "$(loose_perms "$P/data")"
+check "retention removed the old .sql.gz" test ! -e "$P/data/backups/ancient.sql.gz"
+assert_same_tables other_db local_other_db
+cp "$P/data/backups/other_db.sql.gz" "$WORK/other_db.sql.gz"
+
+new_project 'SYNC_DATABASES="other_db"' 'MAX_THREADS=2'
+run_tool multi_thread_sync.sh; rc=$?
+eq "multi-thread exit code 0" 0 "$rc"
+check "multi-thread dump is .sql.gz" bash -c "ls '$P'/data/backups/multi_thread_sync/other_db-*.sql.gz >/dev/null 2>&1"
+eq "multi-thread: nothing group/world accessible" "" "$(loose_perms "$P/data")"
+new_project 'TABLE_SYNC_CONFIG="other_db:local_other_db:t1,t2"'
+run_tool multi_thread_table_sync.sh; rc=$?
+eq "table sync exit code 0" 0 "$rc"
+check "table dump is .sql.gz" bash -c "ls '$P'/data/backups/multi_thread_table_sync/other_db_t1-*.sql.gz >/dev/null 2>&1"
+eq "table sync: nothing group/world accessible" "" "$(loose_perms "$P/data")"
+assert_same_tables other_db local_other_db t1 t2
+
+CURRENT="dumps: BACKUP_COMPRESSION=none"; echo; echo "== $CURRENT =="
+reset_local
+new_project 'SYNC_DATABASES="other_db"' 'BACKUP_COMPRESSION=none'
+run_tool sync_databases.sh; rc=$?
+eq "exit code 0" 0 "$rc"
+check "plain .sql dump" test -f "$P/data/backups/other_db.sql"
+check "no .gz written" bash -c "! ls '$P'/data/backups/*.gz >/dev/null 2>&1"
+eq "dump file mode" 600 "$(stat -c %a "$P/data/backups/other_db.sql")"
+assert_same_tables other_db local_other_db
+new_project 'SYNC_DATABASES="other_db"' 'BACKUP_COMPRESSION=zip'
+run_tool sync_databases.sh; rc=$?
+check "invalid BACKUP_COMPRESSION refused" test "$rc" -ne 0
+check "message names the setting" log_has "BACKUP_COMPRESSION"
+
+CURRENT="dumps: failed dump leaves nothing behind"; echo; echo "== $CURRENT =="
+new_project 'SYNC_DATABASES="no_such_db"'
+run_tool sync_databases.sh; rc=$?
+check "missing source database fails the run" test "$rc" -ne 0
+check "no dump file kept" bash -c "! ls '$P'/data/backups/no_such_db.sql* >/dev/null 2>&1"
+eq "no local database created" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='local_no_such_db'")"
+new_project 'SYNC_DATABASES="no_such_db"'
+run_tool multi_thread_sync.sh; rc=$?
+check "multi-thread: missing source database fails the run" test "$rc" -ne 0
+check "multi-thread: no dump file kept" bash -c "! ls '$P'/data/backups/multi_thread_sync/no_such_db-* >/dev/null 2>&1"
+
+CURRENT="dumps: import from .sql.gz and .sql"; echo; echo "== $CURRENT =="
+lq 'DROP DATABASE IF EXISTS imported_other_db; DROP DATABASE IF EXISTS imported_plain_copy' >/dev/null 2>&1
+new_project 'IMPORT_BACKUP_DIR=backups'
+mkdir -p "$P/backups"
+cp "$WORK/other_db.sql.gz" "$P/backups/other_db.sql.gz"
+gzip -dc "$WORK/other_db.sql.gz" > "$P/backups/plain_copy.sql"
+run_tool import_from_backups.sh; rc=$?
+eq "exit code 0" 0 "$rc"
+assert_same_tables other_db imported_other_db
+assert_same_tables other_db imported_plain_copy
+check "no plaintext temp files left in the backup dir" bash -c "! ls '$P'/backups/*.tmp* >/dev/null 2>&1"
+lq 'DROP DATABASE IF EXISTS imported_other_db; DROP DATABASE IF EXISTS imported_plain_copy' >/dev/null 2>&1
+
+# =============================================================================
+CURRENT="disk space check"; echo; echo "== $CURRENT =="
+reset_local
+new_project 'SYNC_DATABASES="other_db"' 'MIN_FREE_DISK_MB=999999999'
+run_tool sync_databases.sh; rc=$?
+check "not enough space: refused" test "$rc" -ne 0
+check "message explains why" log_has "Not enough free disk space"
+check "nothing was dumped" bash -c "! ls '$P'/data/backups/*.sql* >/dev/null 2>&1"
+eq "nothing was created locally" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='local_other_db'")"
+new_project 'SYNC_DATABASES="other_db"' 'MIN_FREE_DISK_MB=999999999'
+run_tool multi_thread_sync.sh; rc=$?
+check "multi-thread: not enough space: refused" test "$rc" -ne 0
+new_project 'TABLE_SYNC_CONFIG="other_db:local_other_db:t1"' 'MIN_FREE_DISK_MB=999999999'
+run_tool multi_thread_table_sync.sh; rc=$?
+check "table sync: not enough space: refused" test "$rc" -ne 0
+new_project 'SYNC_DATABASES="other_db"' 'MIN_FREE_DISK_MB=999999999' 'DISK_SPACE_CHECK=false'
+run_tool sync_databases.sh; rc=$?
+eq "DISK_SPACE_CHECK=false skips the check" 0 "$rc"
+new_project 'SYNC_DATABASES="other_db"' 'MIN_FREE_DISK_MB=lots'
+run_tool sync_databases.sh; rc=$?
+check "invalid MIN_FREE_DISK_MB refused" test "$rc" -ne 0
+
+CURRENT="config file permissions"; echo; echo "== $CURRENT =="
+new_project 'SYNC_DATABASES="other_db"'
+chmod 644 "$P/config/config.env"
+run_raw sync_databases.sh --dry-run
+check "warns when config.env is world-readable" log_has "readable by other users"
+chmod 600 "$P/config/config.env"
+run_raw sync_databases.sh --dry-run
+check "no warning at mode 600" bash -c "! grep -q 'readable by other users' '$P/out.log'"
+
+# =============================================================================
+CURRENT="TLS to the remote server"; echo; echo "== $CURRENT =="
+reset_local
+new_project 'SYNC_DATABASES="other_db"' 'REMOTE_SSL_MODE=REQUIRED'
+run_tool sync_databases.sh; rc=$?
+eq "REQUIRED: exit code 0" 0 "$rc"
+check "REQUIRED: connection is reported encrypted" log_has "Remote connection is encrypted"
+assert_same_tables other_db local_other_db
+new_project 'SYNC_DATABASES="other_db"' 'REMOTE_SSL_MODE=DISABLED'
+run_raw sync_databases.sh --dry-run
+check "DISABLED: connection is reported NOT encrypted" log_has "Remote connection is NOT encrypted"
+new_project 'SYNC_DATABASES="other_db"' 'REMOTE_SSL_MODE=sometimes'
+run_tool sync_databases.sh; rc=$?
+check "unknown REMOTE_SSL_MODE refused" test "$rc" -ne 0
+check "message lists valid modes" log_has "REMOTE_SSL_MODE must be one of"
+new_project 'SYNC_DATABASES="other_db"' 'REMOTE_SSL_MODE=VERIFY_CA'
+run_tool sync_databases.sh; rc=$?
+check "VERIFY_CA without a CA refused" test "$rc" -ne 0
+check "message asks for REMOTE_SSL_CA" log_has "requires REMOTE_SSL_CA"
+new_project 'SYNC_DATABASES="other_db"' 'REMOTE_SSL_CA=/nonexistent/ca.pem'
+run_tool sync_databases.sh; rc=$?
+check "missing CA file refused" test "$rc" -ne 0
 
 # =============================================================================
 CURRENT="hostile credentials"; echo; echo "== $CURRENT =="

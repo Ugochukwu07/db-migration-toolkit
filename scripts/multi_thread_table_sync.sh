@@ -90,7 +90,7 @@ sync_dump_table() {
     local TIMESTAMP="$5"
     local attempt="$6"
     local error_file="$TMP_DIR/${DB}_${TABLE}_dump_error-$TIMESTAMP.log"
-    local backup_file="$BACKUP_DIR/${DB}_${TABLE}-${TIMESTAMP}.sql"
+    local backup_file="$BACKUP_DIR/${DB}_${TABLE}-${TIMESTAMP}$(backup_ext)"
     
     thread_log "INFO" "$DB" "$TABLE" "Step 1/2: Dumping table $TABLE from $DB on remote database (attempt $attempt)..."
     thread_log "INFO" "$DB" "$TABLE" "Backup file: $backup_file"
@@ -107,7 +107,8 @@ sync_dump_table() {
     fi
     
     # Execute dump command
-    if ! remote_mysqldump --single-transaction "${dump_opts[@]}" "$DB" "$TABLE" > "$backup_file" 2>"$error_file"; then
+    if ! dump_to_file "$backup_file" "$error_file" remote_mysqldump --single-transaction "${dump_opts[@]}" "$DB" "$TABLE"; then
+        rm -f -- "$backup_file"
         local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
         thread_log "ERROR" "$DB" "$TABLE" "Dump failed (attempt $attempt): ${error_msg}"
         echo "DUMP_ERROR:$DB:$TABLE:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
@@ -122,14 +123,14 @@ sync_dump_table() {
     fi
 
     # Verify the dump contains the table structure
-    if ! grep -q "CREATE TABLE" "$backup_file"; then
+    if ! backup_has_text "$backup_file" "CREATE TABLE"; then
         thread_log "ERROR" "$DB" "$TABLE" "Dump file doesn't contain table structure (attempt $attempt)"
         echo "DUMP_ERROR:$DB:$TABLE:attempt_$attempt:No table structure found:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
 
     local dump_size=$(du -h "$backup_file" | cut -f1)
-    local row_count=$(grep -c "INSERT INTO" "$backup_file" 2>/dev/null || true)
+    local row_count=$(backup_count_text "$backup_file" "INSERT INTO")
     thread_log "SUCCESS" "$DB" "$TABLE" "Table dump completed successfully (Size: $dump_size, Inserts: $row_count, attempt $attempt)"
     rm -f "$error_file"  # Clean up error file on success
     return 0
@@ -145,7 +146,7 @@ sync_import_table() {
     local TIMESTAMP="$6"
     local attempt="$7"
     local error_file="$TMP_DIR/${SOURCE_DB}_${TABLE}_import_error-$TIMESTAMP.log"
-    local backup_file="$BACKUP_DIR/${SOURCE_DB}_${TABLE}-${TIMESTAMP}.sql"
+    local backup_file="$BACKUP_DIR/${SOURCE_DB}_${TABLE}-${TIMESTAMP}$(backup_ext)"
     local local_db_name="$TARGET_DB"
     
     thread_log "INFO" "$SOURCE_DB" "$TABLE" "Step 2/2: Importing table into local database $local_db_name (attempt $attempt)..."
@@ -163,7 +164,7 @@ sync_import_table() {
     fi
     
     # Replace the table: existing data is snapshotted first and restored if the import fails
-    local safety_file="$BACKUP_DIR/pre-sync_${SOURCE_DB}_${TABLE}-${TIMESTAMP}.sql"
+    local safety_file="$BACKUP_DIR/pre-sync_${SOURCE_DB}_${TABLE}-${TIMESTAMP}$(backup_ext)"
     local drop_first=false
     should_drop_existing_tables && drop_first=true
     
@@ -255,6 +256,7 @@ LOG_DIR="$DATA_DIR/logs"
 
 # Create directory structure
 mkdir -p "$BACKUP_DIR" "$TMP_DIR" "$LOG_DIR"
+secure_dirs "$BACKUP_DIR" "$TMP_DIR" "$LOG_DIR"
 
 # Ensure proper permissions for directories
 for dir in "$BACKUP_DIR" "$TMP_DIR" "$LOG_DIR"; do
@@ -344,6 +346,7 @@ fi
 
 # Safety guards + plan + confirmation (before anything is dumped or dropped)
 plan_and_confirm_tables TABLE_LIST
+check_disk_for_tables "$BACKUP_DIR" TABLE_LIST || exit 1
 
 # Show table list in debug mode
 if is_debug_mode; then
@@ -426,9 +429,9 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
         log "INFO" "Successfully synchronized tables:"
         grep "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" | while IFS=':' read -r status source_db target_db table duration attempt timestamp; do
             if [ -n "$attempt" ]; then
-                log "INFO" "  - $source_db.$table -> $target_db (completed in $duration, attempt $attempt) -> ${source_db}_${table}-${timestamp}.sql"
+                log "INFO" "  - $source_db.$table -> $target_db (completed in $duration, attempt $attempt) -> ${source_db}_${table}-${timestamp}$(backup_ext)"
             else
-                log "INFO" "  - $source_db.$table -> $target_db (completed in $duration) -> ${source_db}_${table}-${timestamp}.sql"
+                log "INFO" "  - $source_db.$table -> $target_db (completed in $duration) -> ${source_db}_${table}-${timestamp}$(backup_ext)"
             fi
         done
     fi
@@ -453,7 +456,7 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
     
     # Show file locations
     log "INFO" "Generated Files:"
-    log "INFO" "  - Table dump files: $BACKUP_DIR/*_*-$TIMESTAMP.sql"
+    log "INFO" "  - Table dump files: $BACKUP_DIR/*_*-$TIMESTAMP$(backup_ext)"
     log "INFO" "  - Status file: $TMP_DIR/sync_status-$TIMESTAMP.tmp"
     log "INFO" "  - Error log: $TMP_DIR/error_log-$TIMESTAMP.tmp"
 else
@@ -463,7 +466,7 @@ fi
 # Clean up old backups if retention policy is set
 if [ -n "${BACKUP_RETENTION_DAYS:-}" ] && [ "${BACKUP_RETENTION_DAYS}" -gt 0 ]; then
     log "INFO" "Cleaning up backups older than ${BACKUP_RETENTION_DAYS} days"
-    find "$BACKUP_DIR" -name "*.sql" -mtime +${BACKUP_RETENTION_DAYS} -delete 2>/dev/null || true
+    cleanup_old_backups "$BACKUP_DIR" "${BACKUP_RETENTION_DAYS}"
     log "INFO" "Backup cleanup completed"
 fi
 

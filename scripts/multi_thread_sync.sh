@@ -85,7 +85,7 @@ sync_dump_database() {
     local TIMESTAMP="$4"
     local attempt="$5"
     local error_file="$TMP_DIR/${DB}_dump_error-$TIMESTAMP.log"
-    local backup_file="$BACKUP_DIR/${DB}-${TIMESTAMP}.sql"
+    local backup_file="$BACKUP_DIR/${DB}-${TIMESTAMP}$(backup_ext)"
     
     thread_log "INFO" "$DB" "Step 1/2: Dumping $DB from remote server (attempt $attempt)..."
     thread_log "INFO" "$DB" "Backup file: $backup_file"
@@ -102,7 +102,8 @@ sync_dump_database() {
     fi
     
     # Execute dump command
-    if ! remote_mysqldump --single-transaction "${dump_opts[@]}" "$DB" > "$backup_file" 2>"$error_file"; then
+    if ! dump_to_file "$backup_file" "$error_file" remote_mysqldump --single-transaction "${dump_opts[@]}" "$DB"; then
+        rm -f -- "$backup_file"
         local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
         thread_log "ERROR" "$DB" "Dump failed (attempt $attempt): ${error_msg}"
         echo "DUMP_ERROR:$DB:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
@@ -132,8 +133,8 @@ sync_import_database() {
     local TIMESTAMP="$4"
     local attempt="$5"
     local error_file="$TMP_DIR/${DB}_import_error-$TIMESTAMP.log"
-    local backup_file="$BACKUP_DIR/${DB}-${TIMESTAMP}.sql"
-    local safety_file="$BACKUP_DIR/pre-sync_${DB}-${TIMESTAMP}.sql"
+    local backup_file="$BACKUP_DIR/${DB}-${TIMESTAMP}$(backup_ext)"
+    local safety_file="$BACKUP_DIR/pre-sync_${DB}-${TIMESTAMP}$(backup_ext)"
     local LOCAL_DB_NAME=$(get_local_database_name "$DB")
     
     thread_log "INFO" "$DB" "Step 2/2: Replacing local database $LOCAL_DB_NAME from $backup_file (attempt $attempt)..."
@@ -209,6 +210,8 @@ LOG_DIR="$DATA_DIR/logs"
 
 # Create directory structure
 mkdir -p "$BACKUP_DIR" "$TMP_DIR" "$LOG_DIR"
+secure_dirs "$BACKUP_DIR" "$TMP_DIR" "$LOG_DIR"
+check_disk_for_databases "$BACKUP_DIR" DATABASES || exit 1
 
 # Ensure proper permissions for directories
 for dir in "$BACKUP_DIR" "$TMP_DIR" "$LOG_DIR"; do
@@ -313,9 +316,9 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
         grep "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" | while IFS=':' read -r status db duration attempt timestamp; do
             local_db_name=$(get_local_database_name "$db")
             if [ -n "$attempt" ]; then
-                log "INFO" "  - $db -> $local_db_name (completed in $duration, attempt $attempt) -> ${db}-${timestamp}.sql"
+                log "INFO" "  - $db -> $local_db_name (completed in $duration, attempt $attempt) -> ${db}-${timestamp}$(backup_ext)"
             else
-                log "INFO" "  - $db -> $local_db_name (completed in $duration) -> ${db}-${timestamp}.sql"
+                log "INFO" "  - $db -> $local_db_name (completed in $duration) -> ${db}-${timestamp}$(backup_ext)"
             fi
         done
     fi
@@ -342,7 +345,7 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
     
     # Show file locations
     log "INFO" "Generated Files:"
-    log "INFO" "  - Backup files: $BACKUP_DIR/*-$TIMESTAMP.sql"
+    log "INFO" "  - Backup files: $BACKUP_DIR/*-$TIMESTAMP$(backup_ext)"
     log "INFO" "  - Status file: $TMP_DIR/sync_status-$TIMESTAMP.tmp"
     log "INFO" "  - Error log: $TMP_DIR/error_log-$TIMESTAMP.tmp"
 else
@@ -352,7 +355,7 @@ fi
 # Clean up old backups if retention policy is set
 if [ -n "${BACKUP_RETENTION_DAYS:-}" ] && [ "${BACKUP_RETENTION_DAYS}" -gt 0 ]; then
     log "INFO" "Cleaning up backups older than ${BACKUP_RETENTION_DAYS} days"
-    find "$BACKUP_DIR" -name "*.sql" -mtime +${BACKUP_RETENTION_DAYS} -delete 2>/dev/null || true
+    cleanup_old_backups "$BACKUP_DIR" "${BACKUP_RETENTION_DAYS}"
     log "INFO" "Backup cleanup completed"
 fi
 

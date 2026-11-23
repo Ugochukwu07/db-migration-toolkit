@@ -45,6 +45,13 @@ load_config() {
         return 1
     fi
     
+    # The config holds passwords: warn if other users can read it
+    local perms
+    perms=$(stat -c '%a' "$config_file" 2>/dev/null || stat -f '%Lp' "$config_file" 2>/dev/null)
+    if [ -n "$perms" ] && [ "${perms: -2}" != "00" ]; then
+        config_log "WARN" "$config_file is readable by other users (mode $perms) and contains passwords. Run: chmod 600 \"$config_file\""
+    fi
+
     # Source the configuration file with error handling
     if ! source "$config_file" 2>/dev/null; then
         config_log "ERROR" "Failed to source configuration file: $config_file"
@@ -191,6 +198,43 @@ validate_config() {
         fi
     done
     
+    # Dump handling
+    case "${BACKUP_COMPRESSION:-gzip}" in
+        gzip|none) ;;
+        *) config_log "ERROR" "BACKUP_COMPRESSION must be 'gzip' or 'none'"; ((validation_errors++)) ;;
+    esac
+    if [ "${BACKUP_COMPRESSION:-gzip}" = "gzip" ] && ! command -v gzip >/dev/null 2>&1; then
+        config_log "ERROR" "BACKUP_COMPRESSION=gzip but gzip is not installed (install it or set BACKUP_COMPRESSION=none)"
+        ((validation_errors++))
+    fi
+    if [ -n "${DISK_SPACE_CHECK:-}" ] && [[ ! "${DISK_SPACE_CHECK}" =~ ^(true|false)$ ]]; then
+        config_log "ERROR" "DISK_SPACE_CHECK must be 'true' or 'false'"
+        ((validation_errors++))
+    fi
+    if [ -n "${MIN_FREE_DISK_MB:-}" ] && ! [[ "${MIN_FREE_DISK_MB}" =~ ^[0-9]+$ ]]; then
+        config_log "ERROR" "MIN_FREE_DISK_MB must be a non-negative number"
+        ((validation_errors++))
+    fi
+
+    # TLS settings
+    local side mode_var ca_var mode ca
+    for side in REMOTE LOCAL; do
+        mode_var="${side}_SSL_MODE"; ca_var="${side}_SSL_CA"
+        mode="${!mode_var:-}"; ca="${!ca_var:-}"
+        if [ -n "$mode" ] && [[ ! "${mode^^}" =~ ^(DISABLED|PREFERRED|REQUIRED|VERIFY_CA|VERIFY_IDENTITY)$ ]]; then
+            config_log "ERROR" "$mode_var must be one of DISABLED, PREFERRED, REQUIRED, VERIFY_CA, VERIFY_IDENTITY"
+            ((validation_errors++))
+        fi
+        if [ -n "$ca" ] && [ ! -r "$ca" ]; then
+            config_log "ERROR" "$ca_var points to a file that does not exist or is not readable: $ca"
+            ((validation_errors++))
+        fi
+        if [ "${mode^^}" = "VERIFY_CA" ] && [ -z "$ca" ]; then
+            config_log "ERROR" "$mode_var=VERIFY_CA requires $ca_var"
+            ((validation_errors++))
+        fi
+    done
+
     # CHARSET / COLLATION are interpolated into SQL, so restrict them
     for var in CHARSET COLLATION; do
         if [ -n "${!var:-}" ] && ! [[ "${!var}" =~ ^[A-Za-z0-9_]+$ ]]; then
@@ -233,6 +277,8 @@ test_database_connections() {
     fi
     
     if [ $test_errors -eq 0 ]; then
+        report_tls_status remote
+        report_tls_status local
         config_log "INFO" "Database connection tests passed"
         return 0
     else
@@ -280,6 +326,10 @@ init_config() {
     local config_file="${1:-$DEFAULT_CONFIG_FILE}"
     local validate_only="${2:-false}"
     
+    # Everything we write (dumps, logs, temp files) holds database contents:
+    # make new files 600 and new directories 700.
+    umask 077
+
     # Load configuration
     if ! load_config "$config_file"; then
         return 1
@@ -366,8 +416,8 @@ _cnf_escape() {
 
 # Write a client option file: _write_cnf <file> <host> <port> <user> <password>
 _write_cnf() {
-    local file="$1" host="$2" port="$3" user="$4" pass="$5"
-    case "$host$port$user$pass" in
+    local file="$1" host="$2" port="$3" user="$4" pass="$5" ssl_mode="${6:-}" ssl_ca="${7:-}"
+    case "$host$port$user$pass$ssl_mode$ssl_ca" in
         *$'\n'*|*$'\r'*)
             config_log "ERROR" "Credentials must not contain newline characters"
             return 1
@@ -381,6 +431,8 @@ _write_cnf() {
             echo "port=\"$(_cnf_escape "$port")\""
             echo "user=\"$(_cnf_escape "$user")\""
             echo "password=\"$(_cnf_escape "$pass")\""
+            if [ -n "$ssl_mode" ]; then echo "ssl-mode=${ssl_mode^^}"; fi
+            if [ -n "$ssl_ca" ]; then echo "ssl-ca=\"$(_cnf_escape "$ssl_ca")\""; fi
         } > "$file"
     )
 }
@@ -403,8 +455,8 @@ init_credentials() {
     }
     REMOTE_CNF="$_CRED_DIR/remote.cnf"
     LOCAL_CNF="$_CRED_DIR/local.cnf"
-    _write_cnf "$REMOTE_CNF" "$REMOTE_HOST" "${REMOTE_PORT:-3306}" "$REMOTE_USER" "$REMOTE_PASS" || return 1
-    _write_cnf "$LOCAL_CNF" "${LOCAL_HOST:-localhost}" "${LOCAL_PORT:-3306}" "$LOCAL_USER" "$LOCAL_PASS" || return 1
+    _write_cnf "$REMOTE_CNF" "$REMOTE_HOST" "${REMOTE_PORT:-3306}" "$REMOTE_USER" "$REMOTE_PASS" "${REMOTE_SSL_MODE:-}" "${REMOTE_SSL_CA:-}" || return 1
+    _write_cnf "$LOCAL_CNF" "${LOCAL_HOST:-localhost}" "${LOCAL_PORT:-3306}" "$LOCAL_USER" "$LOCAL_PASS" "${LOCAL_SSL_MODE:-}" "${LOCAL_SSL_CA:-}" || return 1
     export REMOTE_CNF LOCAL_CNF
     trap cleanup_credentials EXIT
     trap 'cleanup_credentials; exit 130' INT
@@ -674,6 +726,162 @@ plan_and_confirm_tables() {
     confirm_plan lines
 }
 
+# === DUMP FILE HELPERS (private files, optional gzip) ===
+
+# Extension for new dump files
+backup_ext() {
+    if [ "${BACKUP_COMPRESSION:-gzip}" = "gzip" ]; then echo ".sql.gz"; else echo ".sql"; fi
+}
+
+# Run a dump command and store its stdout in <outfile>, gzip-compressed when the
+# name ends in .gz. A failure anywhere in the pipeline (dump OR gzip) fails the
+# call, and compressed output is integrity-checked.
+# Usage: dump_to_file <outfile> <errfile> <command...>
+dump_to_file() {
+    local out="${1:?}" err="${2:?}"
+    shift 2
+    if [[ "$out" == *.gz ]]; then
+        ( set -o pipefail; "$@" 2>"$err" | gzip -c > "$out" ) || return 1
+        gzip -t -- "$out" 2>>"$err" || return 1
+    else
+        "$@" > "$out" 2>"$err" || return 1
+    fi
+}
+
+# Print a dump file as plain SQL, whether or not it is compressed
+read_backup() {
+    case "$1" in
+        *.gz) gzip -dc -- "$1" ;;
+        *)    cat -- "$1" ;;
+    esac
+}
+backup_has_text() { read_backup "$1" 2>/dev/null | grep -q -- "$2"; }
+backup_count_text() { local n; n=$(read_backup "$1" 2>/dev/null | grep -c -- "$2"); echo "${n:-0}"; }
+
+# Delete dumps older than N days (plain and compressed)
+cleanup_old_backups() {
+    local dir="${1:?}" days="${2:?}"
+    find "$dir" \( -name '*.sql' -o -name '*.sql.gz' \) -mtime +"$days" -delete 2>/dev/null || true
+}
+
+# Lock down directories we write dumps/logs to, and any dumps left by older
+# versions that were created world-readable.
+secure_dirs() {
+    local d
+    for d in "$@"; do
+        [ -d "$d" ] || continue
+        chmod 700 "$d" 2>/dev/null || true
+        find "$d" -type f \( -name '*.sql' -o -name '*.sql.gz' -o -name '*.log' -o -name '*.tmp' \) ! -perm 600 -exec chmod 600 {} + 2>/dev/null || true
+    done
+    return 0
+}
+
+# === DISK SPACE CHECK ===
+
+_free_kb() {
+    local p="$1"
+    while [ ! -d "$p" ] && [ "$p" != "/" ]; do p=$(dirname "$p"); done
+    df -Pk "$p" 2>/dev/null | awk 'NR==2 {print $4}'
+}
+
+# Approximate on-disk size (bytes) of a remote database or one table
+remote_bytes() {
+    local db="$1" table="${2:-}" q n
+    q="SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema='$(_sql_str "$db")'"
+    [ -n "$table" ] && q+=" AND table_name='$(_sql_str "$table")'"
+    n=$(remote_mysql -N -B -e "$q" 2>/dev/null)
+    [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
+}
+local_bytes() {
+    local db="$1" table="${2:-}" q n
+    q="SELECT COALESCE(SUM(data_length+index_length),0) FROM information_schema.tables WHERE table_schema='$(_sql_str "$db")'"
+    [ -n "$table" ] && q+=" AND table_name='$(_sql_str "$table")'"
+    n=$(local_mysql -N -B -e "$q" 2>/dev/null)
+    [[ "$n" =~ ^[0-9]+$ ]] && echo "$n" || echo 0
+}
+
+# Refuse to start when the dumps (new dumps from the remote + safety snapshots
+# of what is replaced locally) would not fit, leaving MIN_FREE_DISK_MB spare.
+# Usage: check_disk_space <dir> <remote_bytes> <local_bytes>
+check_disk_space() {
+    [ "${DISK_SPACE_CHECK:-true}" = "true" ] || return 0
+    local dir="${1:?}" rbytes="${2:-0}" lbytes="${3:-0}"
+    local pct=100 free_kb need_mb reserve_mb free_mb
+    [ "${BACKUP_COMPRESSION:-gzip}" = "gzip" ] && pct=40   # text dumps compress roughly 3-5x
+    reserve_mb="${MIN_FREE_DISK_MB:-200}"
+    need_mb=$(( (rbytes + lbytes) * pct / 100 / 1048576 ))
+    free_kb=$(_free_kb "$dir")
+    if ! [[ "$free_kb" =~ ^[0-9]+$ ]]; then
+        config_log "WARN" "Could not determine free disk space for $dir; skipping the disk space check"
+        return 0
+    fi
+    free_mb=$(( free_kb / 1024 ))
+    config_log "INFO" "Disk space: ~${need_mb} MB needed (+${reserve_mb} MB reserve), ${free_mb} MB free in $dir"
+    if [ "$free_mb" -lt $(( need_mb + reserve_mb )) ]; then
+        config_log "ERROR" "Not enough free disk space in $dir: need ~${need_mb} MB plus ${reserve_mb} MB reserve, only ${free_mb} MB free."
+        config_log "ERROR" "Free some space, point BACKUP_DIR elsewhere, lower MIN_FREE_DISK_MB, or set DISK_SPACE_CHECK=false. Nothing was changed."
+        return 1
+    fi
+    return 0
+}
+
+# Usage: check_disk_for_databases <dir> <databases_array_name>
+check_disk_for_databases() {
+    [ "${DISK_SPACE_CHECK:-true}" = "true" ] || return 0
+    local dir="$1"; local -n _cd_dbs=$2
+    local db t r=0 l=0
+    for db in "${_cd_dbs[@]}"; do
+        t=$(get_local_database_name "$db")
+        r=$(( r + $(remote_bytes "$db") ))
+        l=$(( l + $(local_bytes "$t") ))
+    done
+    check_disk_space "$dir" "$r" "$l"
+}
+
+# Usage: check_disk_for_tables <dir> <table_list_array_name>   (entries "src:dst:table")
+check_disk_for_tables() {
+    [ "${DISK_SPACE_CHECK:-true}" = "true" ] || return 0
+    local dir="$1"; local -n _ct_list=$2
+    local e s d t r=0 l=0
+    for e in "${_ct_list[@]}"; do
+        IFS=':' read -r s d t <<< "$e"
+        r=$(( r + $(remote_bytes "$s" "$t") ))
+        l=$(( l + $(local_bytes "$d" "$t") ))
+    done
+    check_disk_space "$dir" "$r" "$l"
+}
+
+# === TLS STATUS ===
+
+# Report whether the connection to the remote/local server is encrypted.
+# Usage: report_tls_status <remote|local>
+report_tls_status() {
+    local side="$1" fn host cipher
+    fn="${side}_mysql"
+    if [ "$side" = "remote" ]; then host="${REMOTE_HOST}"; else host="${LOCAL_HOST:-localhost}"; fi
+    cipher=$("$fn" -N -B -e "SHOW SESSION STATUS LIKE 'Ssl_cipher'" 2>/dev/null | awk '{print $2}')
+    if [ -n "$cipher" ]; then
+        config_log "INFO" "${side^} connection is encrypted ($cipher)"
+        return 0
+    fi
+    case "${host,,}" in
+        localhost|127.*|::1)
+            config_log "INFO" "${side^} connection is NOT encrypted (loopback address)"
+            ;;
+        *)
+            config_log "WARN" "${side^} connection is NOT encrypted: credentials and data cross the network in clear text. Set ${side^^}_SSL_MODE=REQUIRED (or VERIFY_CA with ${side^^}_SSL_CA)."
+            ;;
+    esac
+}
+
+# Import a (possibly gzip-compressed) dump file; fails if either the
+# decompression or the mysql client fails. Usage: _import_backup <db> <file> <errfile> <import_args_array>
+_import_backup() {
+    local db="$1" f="$2" err="$3"
+    local -n _ib_args=$4
+    ( set -o pipefail; read_backup "$f" | local_mysql "${_ib_args[@]}" "$db" ) 2>>"$err"
+}
+
 # === SAFE REPLACE HELPERS (no data loss on a failed import) ===
 # Return codes for replace_local_database / replace_local_table:
 #   0 = replaced and verified
@@ -712,21 +920,23 @@ replace_local_database() {
 
     # 1. Snapshot the current local database so a failure cannot lose it
     if [ "$existed" -eq 1 ]; then
-        if ! ( umask 077; local_mysqldump --single-transaction --routines --triggers --events --set-gtid-purged=OFF "$db" > "$safety_file" ) 2>>"$err_file"; then
+        if ! ( umask 077; dump_to_file "$safety_file" "$err_file.snap" local_mysqldump --single-transaction --routines --triggers --events --set-gtid-purged=OFF "$db" ); then
+            cat "$err_file.snap" >> "$err_file" 2>/dev/null; rm -f -- "${err_file:?}.snap"
             echo "Could not snapshot existing database '$db'; leaving it untouched" >> "$err_file"
             rm -f -- "$safety_file"
             return 2
         fi
+        rm -f -- "${err_file:?}.snap"
     fi
 
     # 2. Replace
     local ok=1
     local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file" || ok=0
     [ $ok -eq 1 ] && { local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" || ok=0; }
-    [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
+    [ $ok -eq 1 ] && { _import_backup "$db" "$dump_file" "$err_file" import_args || ok=0; }
 
     # 3. Verify: if the dump defines tables, they must exist now
-    if [ $ok -eq 1 ] && grep -q "CREATE TABLE" "$dump_file"; then
+    if [ $ok -eq 1 ] && backup_has_text "$dump_file" "CREATE TABLE"; then
         local tables
         tables=$(local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | wc -l)
         if [ "${tables:-0}" -lt 1 ]; then
@@ -744,7 +954,7 @@ replace_local_database() {
     local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file"
     if [ "$existed" -eq 1 ]; then
         if local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" \
-           && local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
+           && _import_backup "$db" "$safety_file" "$err_file" import_args; then
             echo "Rolled back: previous contents of '$db' restored" >> "$err_file"
             _discard_safety "$safety_file"
             return 1
@@ -774,18 +984,20 @@ replace_local_table() {
     fi
 
     if [ "$existed" -eq 1 ]; then
-        if ! ( umask 077; local_mysqldump --single-transaction --triggers --set-gtid-purged=OFF "$db" "$table" > "$safety_file" ) 2>>"$err_file"; then
+        if ! ( umask 077; dump_to_file "$safety_file" "$err_file.snap" local_mysqldump --single-transaction --triggers --set-gtid-purged=OFF "$db" "$table" ); then
+            cat "$err_file.snap" >> "$err_file" 2>/dev/null; rm -f -- "${err_file:?}.snap"
             echo "Could not snapshot existing table '$db.$table'; leaving it untouched" >> "$err_file"
             rm -f -- "$safety_file"
             return 2
         fi
+        rm -f -- "${err_file:?}.snap"
     fi
 
     local ok=1
     if [ "$drop_first" = "true" ]; then
         local_mysql "$db" -e "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file" || ok=0
     fi
-    [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
+    [ $ok -eq 1 ] && { _import_backup "$db" "$dump_file" "$err_file" import_args || ok=0; }
     if [ $ok -eq 1 ] && ! local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
         echo "Import verification failed: table '$table' not found after import" >> "$err_file"
         ok=0
@@ -798,7 +1010,7 @@ replace_local_table() {
 
     local_mysql "$db" -e "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file"
     if [ "$existed" -eq 1 ]; then
-        if local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
+        if _import_backup "$db" "$safety_file" "$err_file" import_args; then
             echo "Rolled back: previous contents of '$db.$table' restored" >> "$err_file"
             _discard_safety "$safety_file"
             return 1
@@ -826,5 +1038,5 @@ export -f should_drop_existing_tables
 export -f _cnf_escape _write_cnf cleanup_credentials init_credentials
 export -f remote_mysql local_mysql remote_mysqldump
 export -f sql_ident create_database_sql read_dump_options local_import_args
-export -f local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table
+export -f backup_ext dump_to_file read_backup backup_has_text backup_count_text cleanup_old_backups secure_dirs remote_bytes local_bytes check_disk_space check_disk_for_databases check_disk_for_tables report_tls_status _import_backup local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table
 export -f print_safety_usage parse_safety_args is_protected_database servers_are_same guard_plan local_db_exists confirm_plan plan_and_confirm_databases plan_and_confirm_tables
