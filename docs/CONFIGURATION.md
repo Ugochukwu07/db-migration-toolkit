@@ -429,3 +429,39 @@ DEBUG_MODE="true"
 ```
 
 This configuration system provides complete flexibility while maintaining simplicity for basic use cases. All scripts automatically use these centralized settings, ensuring consistency across your database migration operations.
+
+## Safety guards
+
+Before anything is dumped or dropped, every sync script (`sync_databases.sh`,
+`multi_thread_sync.sh`, `multi_thread_table_sync.sh`, `import_from_backups.sh`):
+
+1. **Refuses system schemas.** `mysql`, `sys`, `information_schema` and
+   `performance_schema` (case-insensitive) can never be a source or a target.
+   Add your own with `PROTECTED_DATABASES="billing,audit"`.
+2. **Refuses to replace the source with itself.** If the local target is the
+   same MySQL server as the remote source (detected by server identity, so
+   `127.0.0.1`, another loopback address or a DNS alias are all caught) and a
+   target name equals a source name, the run is refused. Set `LOCAL_DB_PREFIX`
+   or use a different target. A target that is also a source in the same run is
+   refused too.
+3. **Shows the plan and asks for confirmation** (type `yes`), listing which
+   targets already exist and will be dropped and replaced.
+
+Any failed check stops the whole run before anything is changed.
+
+| Flag | Effect |
+|------|--------|
+| `--dry-run` | Run all checks, print the plan, change nothing, exit 0 |
+| `-y`, `--yes` | Skip the confirmation prompt |
+
+The prompt is also skipped when `CI=true`. Without a terminal and without
+`--yes` the scripts refuse to run, so **cron jobs and Docker entrypoints must
+pass `--yes`**:
+
+```bash
+./scripts/multi_thread_sync.sh --yes
+./scripts/multi_thread_sync.sh --dry-run   # preview only
+```
+
+`run_with_monitor.sh` shows the plan and asks in the foreground, then starts
+the sync in the background.

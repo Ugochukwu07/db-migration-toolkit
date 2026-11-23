@@ -13,6 +13,8 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # Source the configuration loader
 source "$SCRIPT_DIR/config_loader.sh"
 
+parse_safety_args "$@" || exit 1
+
 # === LOGGING FUNCTION ===
 log() {
     local level="$1"
@@ -39,6 +41,9 @@ if ! parse_database_list DATABASES; then
     log "ERROR" "Example: SYNC_DATABASES=\"database1,database2,database3\""
     exit 1
 fi
+
+# Safety guards + plan + confirmation (before anything is dumped or dropped)
+plan_and_confirm_databases DATABASES
 
 # Create backup directory from configuration
 BACKUP_DIR="${PROJECT_ROOT}/${BACKUP_DIR:-data/backups}"

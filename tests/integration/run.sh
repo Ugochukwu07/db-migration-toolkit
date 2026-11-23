@@ -60,9 +60,15 @@ new_project() { # new_project <extra config lines...>
         for l in "$@"; do echo "$l"; done
     } > "$P/config/config.env"
 }
-run_tool() { # run_tool <script>  (output in $P/out.log, status returned)
-    bash "$P/scripts/$1" > "$P/out.log" 2>&1
+run_tool() { # run_tool <script> [args]  (always --yes; output in $P/out.log, status returned)
+    local script="$1"; shift
+    bash "$P/scripts/$script" --yes "$@" > "$P/out.log" 2>&1
 }
+run_raw() { # run_raw <script> [args]  -- exactly the given flags, no CI env, no stdin
+    local script="$1"; shift
+    env -u CI -u GITHUB_ACTIONS bash "$P/scripts/$script" "$@" > "$P/out.log" 2>&1 < /dev/null
+}
+log_has() { grep -q -- "$1" "$P/out.log"; }
 
 table_checksum() { # table_checksum <q-fn> <db> <table>
     "$1" "CHECKSUM TABLE \`$2\`.\`$3\`" | awk '{print $2}'
@@ -194,6 +200,166 @@ lq "SET GLOBAL max_allowed_packet=$OLD_PACKET" >/dev/null
 check "exit code is non-zero" test "$rc" -ne 0
 eq "failed table keeps its old row" "keep-me" "$(lq 'SELECT CAST(data AS CHAR) FROM rb_target.big WHERE id=7')"
 eq "other table still synced"       "new"     "$(lq 'SELECT v FROM rb_target.small WHERE id=1')"
+
+
+# =============================================================================
+# SAFETY GUARDS
+# =============================================================================
+CURRENT="guard: system schemas (source)"; echo; echo "== $CURRENT =="
+reset_local
+USERS_BEFORE="$(lq 'SELECT COUNT(*) FROM mysql.user')"
+for name in mysql sys information_schema performance_schema MySQL; do
+    new_project "SYNC_DATABASES=\"$name\""
+    run_tool sync_databases.sh; rc=$?
+    check "'$name' refused (non-zero exit)" test "$rc" -ne 0
+    check "'$name' reports protected schema" log_has "protected system schema"
+    check "'$name' was never dumped" bash -c "! ls '$P'/data/backups/*.sql >/dev/null 2>&1"
+    eq "'$name': no local_$name database created" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='local_${name,,}'")"
+done
+new_project 'SYNC_DATABASES="app_db,mysql"' 'MAX_THREADS=2'
+run_tool multi_thread_sync.sh; rc=$?
+check "multi-thread: one bad database refuses the whole run" test "$rc" -ne 0
+eq "multi-thread: the good database was not synced either" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='local_app_db'")"
+eq "mysql.user untouched" "$USERS_BEFORE" "$(lq 'SELECT COUNT(*) FROM mysql.user')"
+
+CURRENT="guard: system schemas (target)"; echo; echo "== $CURRENT =="
+for target in mysql sys information_schema performance_schema; do
+    new_project "TABLE_SYNC_CONFIG=\"app_db:$target:customers\""
+    run_tool multi_thread_table_sync.sh; rc=$?
+    check "table sync into '$target' refused" test "$rc" -ne 0
+    check "'$target' reports protected schema" log_has "protected system schema"
+    eq "no customers table written into '$target'" 0 "$(lq "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='$target' AND table_name='customers'")"
+done
+eq "mysql.user untouched" "$USERS_BEFORE" "$(lq 'SELECT COUNT(*) FROM mysql.user')"
+
+CURRENT="guard: custom PROTECTED_DATABASES"; echo; echo "== $CURRENT =="
+reset_local
+new_project 'SYNC_DATABASES="other_db"' 'PROTECTED_DATABASES="foo, Local_Other_DB"'
+run_tool sync_databases.sh; rc=$?
+check "custom protected target refused" test "$rc" -ne 0
+eq "local_other_db not created" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='local_other_db'")"
+
+# =============================================================================
+CURRENT="guard: same server"; echo; echo "== $CURRENT =="
+reset_local
+OTHER_ROWS="$(rq 'SELECT COUNT(*) FROM other_db.t1')"
+# local pointed at the *remote* server, empty prefix => would replace the source with itself
+new_project 'SYNC_DATABASES="other_db"' "LOCAL_PORT=$RPORT" 'LOCAL_DB_PREFIX='
+run_tool sync_databases.sh; rc=$?
+check "same host+port, empty prefix refused" test "$rc" -ne 0
+check "message explains same server" log_has "SAME server"
+eq "source database intact" "$OTHER_ROWS" "$(rq 'SELECT COUNT(*) FROM other_db.t1')"
+check "source was never dumped" bash -c "! ls '$P'/data/backups/*.sql >/dev/null 2>&1"
+
+# same server reached through a different address (127.0.0.2 is loopback on Linux)
+new_project 'SYNC_DATABASES="other_db"' "LOCAL_PORT=$RPORT" 'LOCAL_HOST=127.0.0.2' 'LOCAL_DB_PREFIX='
+run_tool multi_thread_sync.sh; rc=$?
+check "same server via another address refused" test "$rc" -ne 0
+check "message explains same server" log_has "SAME server"
+eq "source database intact" "$OTHER_ROWS" "$(rq 'SELECT COUNT(*) FROM other_db.t1')"
+
+new_project 'TABLE_SYNC_CONFIG="other_db:other_db:t1"' "LOCAL_PORT=$RPORT"
+run_tool multi_thread_table_sync.sh; rc=$?
+check "table sync onto itself refused" test "$rc" -ne 0
+eq "source table intact" "$OTHER_ROWS" "$(rq 'SELECT COUNT(*) FROM other_db.t1')"
+
+# a prefixed target that is also a source of the same run
+new_project 'SYNC_DATABASES="other_db,x_other_db"' "LOCAL_PORT=$RPORT" 'LOCAL_DB_PREFIX=x_'
+run_tool sync_databases.sh; rc=$?
+check "target that is also a source refused" test "$rc" -ne 0
+check "message mentions SOURCE" log_has "also a SOURCE"
+
+# control: same server is fine when the names differ (no false positive)
+new_project 'SYNC_DATABASES="other_db"' "LOCAL_PORT=$RPORT" 'LOCAL_DB_PREFIX=copy_'
+run_tool sync_databases.sh; rc=$?
+eq "same server with a prefix is allowed" 0 "$rc"
+eq "copy created on the same server" "$OTHER_ROWS" "$(rq 'SELECT COUNT(*) FROM copy_other_db.t1')"
+rq 'DROP DATABASE IF EXISTS copy_other_db' >/dev/null 2>&1
+
+# control: different servers with an identical name need no prefix
+reset_local
+new_project 'SYNC_DATABASES="other_db"' 'LOCAL_DB_PREFIX='
+run_tool sync_databases.sh; rc=$?
+eq "different servers, same name, empty prefix is allowed" 0 "$rc"
+eq "synced" "$OTHER_ROWS" "$(lq 'SELECT COUNT(*) FROM other_db.t1')"
+lq 'DROP DATABASE IF EXISTS other_db' >/dev/null 2>&1
+
+# =============================================================================
+CURRENT="guard: confirmation"; echo; echo "== $CURRENT =="
+reset_local
+new_project 'SYNC_DATABASES="other_db"'
+run_tool sync_databases.sh >/dev/null; tamper() { lq "UPDATE local_other_db.t1 SET v='SENTINEL' WHERE id=1" >/dev/null; }
+sentinel_is() { lq "SELECT v FROM local_other_db.t1 WHERE id=1"; }
+
+tamper
+run_raw sync_databases.sh --dry-run; rc=$?
+eq "--dry-run exits 0" 0 "$rc"
+check "--dry-run prints the plan" log_has "PLANNED CHANGES"
+check "--dry-run flags the existing database" log_has "EXISTS"
+check "--dry-run says nothing was changed" log_has "DRY RUN"
+eq "--dry-run left local data alone" "SENTINEL" "$(sentinel_is)"
+rm -rf -- "${P:?}/data"; run_raw sync_databases.sh --dry-run
+check "--dry-run dumped nothing" bash -c "! ls '$P'/data/backups/*.sql >/dev/null 2>&1"
+
+run_raw sync_databases.sh; rc=$?
+check "no terminal and no --yes: refused" test "$rc" -ne 0
+check "message tells you to use --yes" log_has "Re-run with --yes"
+eq "refusal left local data alone" "SENTINEL" "$(sentinel_is)"
+
+run_raw sync_databases.sh --bogus; rc=$?
+check "unknown option rejected" test "$rc" -ne 0
+eq "unknown option left local data alone" "SENTINEL" "$(sentinel_is)"
+
+env CI=true bash "$P/scripts/sync_databases.sh" > "$P/out.log" 2>&1 < /dev/null; rc=$?
+eq "CI=true skips the prompt" 0 "$rc"
+eq "CI=true replaced the data" "a" "$(sentinel_is)"
+
+tamper
+run_raw sync_databases.sh --yes; rc=$?
+eq "--yes skips the prompt" 0 "$rc"
+eq "--yes replaced the data" "a" "$(sentinel_is)"
+
+if command -v script >/dev/null 2>&1; then
+    tamper
+    { printf 'no\n'; sleep 5; } | timeout 120 script -qec "env -u CI -u GITHUB_ACTIONS bash '$P/scripts/sync_databases.sh'" /dev/null > "$P/out.log" 2>&1; rc=$?
+    check "answering 'no' aborts" test "$rc" -ne 0
+    check "prompt was shown" log_has "Type 'yes'"
+    eq "answering 'no' left local data alone" "SENTINEL" "$(sentinel_is)"
+    { printf 'yes\n'; sleep 5; } | timeout 120 script -qec "env -u CI -u GITHUB_ACTIONS bash '$P/scripts/sync_databases.sh'" /dev/null > "$P/out.log" 2>&1; rc=$?
+    eq "answering 'yes' proceeds" 0 "$rc"
+    eq "answering 'yes' replaced the data" "a" "$(sentinel_is)"
+else
+    echo "  (skipped interactive prompt tests: 'script' not installed)"
+fi
+
+# the other entry points honour --dry-run too
+tamper
+run_raw multi_thread_sync.sh --dry-run; rc=$?
+eq "multi-thread --dry-run exits 0" 0 "$rc"
+eq "multi-thread --dry-run left data alone" "SENTINEL" "$(sentinel_is)"
+new_project 'TABLE_SYNC_CONFIG="other_db:local_other_db:t1"'
+run_raw multi_thread_table_sync.sh --dry-run; rc=$?
+eq "table sync --dry-run exits 0" 0 "$rc"
+check "table sync plan lists the table" log_has "t1 -> local_other_db.t1"
+eq "table sync --dry-run left data alone" "SENTINEL" "$(sentinel_is)"
+run_raw multi_thread_table_sync.sh; rc=$?
+check "table sync without --yes refused" test "$rc" -ne 0
+eq "table sync refusal left data alone" "SENTINEL" "$(sentinel_is)"
+
+# import_from_backups: plan, dry-run, protection
+new_project 'IMPORT_BACKUP_DIR=backups' 'PROTECTED_DATABASES="imported_secret"'
+mkdir -p "$P/backups"
+printf 'CREATE TABLE t (id INT);\nINSERT INTO t VALUES (1);\n' > "$P/backups/imp1.sql"
+run_raw import_from_backups.sh --dry-run; rc=$?
+eq "import --dry-run exits 0" 0 "$rc"
+check "import plan shows the target" log_has "imp1.sql -> imported_imp1"
+eq "import --dry-run created nothing" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='imported_imp1'")"
+printf 'CREATE TABLE t (id INT);\n' > "$P/backups/secret.sql"
+run_tool import_from_backups.sh; rc=$?
+check "import into a protected name refused" test "$rc" -ne 0
+eq "refused import created nothing (secret)" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='imported_secret'")"
+eq "refused import created nothing (imp1)" 0 "$(lq "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='imported_imp1'")"
+lq 'DROP DATABASE IF EXISTS imported_imp1' >/dev/null 2>&1
 
 # =============================================================================
 echo; echo "================ SUMMARY ================"

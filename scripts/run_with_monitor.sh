@@ -8,6 +8,20 @@ PID_FILE="./sync_pids.tmp"
 
 echo "🚀 Starting database synchronization with monitoring..."
 
+# The sync runs in the background with its output in a log file, so it cannot
+# ask for confirmation itself. Show the plan and ask here, in the foreground.
+case " $* " in
+    *" --yes "*|*" -y "*|*" --dry-run "*) ;;
+    *)
+        ./multi_thread_sync.sh --dry-run || exit 1
+        if [ "${CI:-}" != "true" ]; then
+            read -r -p "Type 'yes' to run this sync: " CONFIRM
+            [ "$CONFIRM" = "yes" ] || { echo "Aborted: nothing was changed."; exit 1; }
+        fi
+        set -- "$@" --yes
+        ;;
+esac
+
 # Clean up old log and PID files
 rm -f "$LOG_FILE"
 rm -f "$PID_FILE"
@@ -17,7 +31,7 @@ set -m  # Enable job control
 
 # Start the sync process in background with logging
 echo "📝 Starting sync process (logging to $LOG_FILE)..."
-./multi_thread_sync.sh > "$LOG_FILE" 2>&1 &
+./multi_thread_sync.sh "$@" > "$LOG_FILE" 2>&1 &
 SYNC_PID=$!
 
 # Store the main PID and process group

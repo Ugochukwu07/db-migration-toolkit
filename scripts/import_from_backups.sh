@@ -13,6 +13,8 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # Source the configuration loader
 source "$SCRIPT_DIR/config_loader.sh"
 
+parse_safety_args "$@" || exit 1
+
 # === MAIN SCRIPT ===
 
 # Initialize configuration
@@ -31,6 +33,28 @@ if [ ! -d "$BACKUP_DIR" ]; then
     echo "Please check the IMPORT_BACKUP_DIR setting in your configuration."
     exit 1
 fi
+
+# Safety guards + plan + confirmation (before any database is dropped).
+# There is no remote source here, so only the protected-schema rule applies.
+declare -a IMPORT_SRC=() IMPORT_DST=() IMPORT_PLAN=()
+for SQL_FILE in "$BACKUP_DIR"/*.sql; do
+    [ -f "$SQL_FILE" ] || continue
+    n=$(basename "$SQL_FILE" .sql)
+    IMPORT_SRC+=("$n"); IMPORT_DST+=("$LOCAL_DB_PREFIX$n")
+done
+if [ ${#IMPORT_SRC[@]} -eq 0 ]; then
+    echo "No .sql files found in $BACKUP_DIR"
+    exit 1
+fi
+guard_plan IMPORT_SRC IMPORT_DST true || { echo "Safety checks failed. Nothing was changed."; exit 1; }
+for i in "${!IMPORT_SRC[@]}"; do
+    if local_db_exists "${IMPORT_DST[$i]}"; then
+        IMPORT_PLAN+=("${IMPORT_SRC[$i]}.sql -> ${IMPORT_DST[$i]}   [EXISTS: dropped and replaced]")
+    else
+        IMPORT_PLAN+=("${IMPORT_SRC[$i]}.sql -> ${IMPORT_DST[$i]}   [new]")
+    fi
+done
+confirm_plan IMPORT_PLAN
 
 echo "Starting import from $BACKUP_DIR..."
 echo "Local database prefix: $LOCAL_DB_PREFIX"

@@ -466,6 +466,214 @@ local_import_args() {
     _args_ref=(--init-command="$init")
 }
 
+# === SAFETY GUARDS (run before anything destructive) ===
+# 1. System schemas can never be a source or a target.
+# 2. The target can never be the source server's own copy of the same database.
+# 3. The user sees the plan and must confirm (or pass --yes / run in CI).
+#    --dry-run prints the plan and stops.
+
+BUILTIN_PROTECTED_DATABASES="mysql sys information_schema performance_schema"
+DRY_RUN="${DRY_RUN:-false}"
+ASSUME_YES="${ASSUME_YES:-false}"
+
+print_safety_usage() {
+    cat <<USAGE
+Usage: $(basename "$0") [--dry-run] [--yes]
+
+  --dry-run   Validate the configuration, run all safety checks, print what
+              would be replaced, then exit without changing anything.
+  -y, --yes   Do not ask for confirmation (also skipped when CI=true).
+  -h, --help  Show this help.
+
+Without --yes the script asks for confirmation before the first drop and
+refuses to run non-interactively.
+USAGE
+}
+
+# Parse the common safety flags. Usage: parse_safety_args "$@"
+parse_safety_args() {
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --dry-run) DRY_RUN=true ;;
+            -y|--yes) ASSUME_YES=true ;;
+            -h|--help) print_safety_usage; exit 0 ;;
+            *) echo "Unknown option: $a" >&2; print_safety_usage >&2; return 1 ;;
+        esac
+    done
+    return 0
+}
+
+# Is this a protected schema? Built-ins plus PROTECTED_DATABASES (comma separated).
+is_protected_database() {
+    local name="${1,,}" p extra
+    for p in $BUILTIN_PROTECTED_DATABASES; do
+        [ "$name" = "$p" ] && return 0
+    done
+    IFS=',' read -ra extra <<< "${PROTECTED_DATABASES:-}"
+    for p in "${extra[@]}"; do
+        p="${p#"${p%%[![:space:]]*}"}"; p="${p%"${p##*[![:space:]]}"}"
+        [ -n "$p" ] && [ "$name" = "${p,,}" ] && return 0
+    done
+    return 1
+}
+
+_SAME_SERVER_CACHE=""
+
+# Are the remote (source) and local (target) connections the same MySQL server?
+# Compares a server identity (hostname|port|server_uuid) so aliases such as
+# 127.0.0.1 vs 127.0.0.2 vs a DNS name are caught. Falls back to comparing the
+# configured host and port only when the identity can't be read.
+servers_are_same() {
+    [ -n "$_SAME_SERVER_CACHE" ] && { [ "$_SAME_SERVER_CACHE" = "yes" ]; return; }
+    local rid lid
+    rid=$(remote_mysql -N -B -e "SELECT CONCAT_WS('|',@@hostname,@@port,@@server_uuid)" 2>/dev/null) \
+        || rid=$(remote_mysql -N -B -e "SELECT CONCAT_WS('|',@@hostname,@@port,@@datadir)" 2>/dev/null) || rid=""
+    lid=$(local_mysql -N -B -e "SELECT CONCAT_WS('|',@@hostname,@@port,@@server_uuid)" 2>/dev/null) \
+        || lid=$(local_mysql -N -B -e "SELECT CONCAT_WS('|',@@hostname,@@port,@@datadir)" 2>/dev/null) || lid=""
+    if [ -n "$rid" ] && [ -n "$lid" ]; then
+        [ "$rid" = "$lid" ] && _SAME_SERVER_CACHE=yes || _SAME_SERVER_CACHE=no
+    else
+        local rh="${REMOTE_HOST,,}" lh="${LOCAL_HOST:-localhost}"
+        lh="${lh,,}"
+        # 'localhost' means a unix socket, whose port is ignored, so it proves nothing
+        if [ "$rh" = "$lh" ] && [ "$rh" != "localhost" ] && [ "${REMOTE_PORT:-3306}" = "${LOCAL_PORT:-3306}" ]; then
+            _SAME_SERVER_CACHE=yes
+        else
+            _SAME_SERVER_CACHE=no
+        fi
+    fi
+    [ "$_SAME_SERVER_CACHE" = "yes" ]
+}
+
+# Validate every (source, target) database pair of a plan. Prints every problem
+# found and returns 1 if there is any.
+# Usage: guard_plan <src_array_name> <dst_array_name> [skip_same_server=false]
+guard_plan() {
+    local -n _gp_src=$1
+    local -n _gp_dst=$2
+    local skip_same="${3:-false}" i s d bad=0 same=false o
+    if [ "$skip_same" != "true" ] && servers_are_same; then
+        same=true
+    fi
+    for i in "${!_gp_src[@]}"; do
+        s="${_gp_src[$i]}"; d="${_gp_dst[$i]}"
+        if [ "$skip_same" != "true" ] && is_protected_database "$s"; then
+            config_log "ERROR" "Refusing to sync from '$s': it is a protected system schema"
+            bad=1
+        fi
+        if is_protected_database "$d"; then
+            config_log "ERROR" "Refusing to write to '$d': it is a protected system schema"
+            bad=1
+        fi
+        if [ "$same" = "true" ]; then
+            if [ "${s,,}" = "${d,,}" ]; then
+                config_log "ERROR" "Refusing to sync '$s' onto itself: the local target is the SAME server as the remote source and the database name is identical."
+                config_log "ERROR" "Set LOCAL_DB_PREFIX (e.g. LOCAL_DB_PREFIX=\"copy_\") or use a different target database."
+                bad=1
+            else
+                for o in "${_gp_src[@]}"; do
+                    if [ "${o,,}" = "${d,,}" ]; then
+                        config_log "ERROR" "Refusing to write '$d': on the same server it is also a SOURCE database in this run."
+                        bad=1
+                    fi
+                done
+            fi
+        fi
+    done
+    return $bad
+}
+
+# Does a database exist on the local (target) server?
+local_db_exists() {
+    local n
+    n=$(local_mysql -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='$(_sql_str "$1")'" 2>/dev/null) || return 1
+    [ "${n:-0}" -gt 0 ]
+}
+
+# Show the plan and decide whether to continue. Exits the script for --dry-run
+# (status 0) and for a declined / impossible confirmation (status 1).
+# Usage: confirm_plan <plan_lines_array_name>
+confirm_plan() {
+    local -n _cp_lines=$1
+    local line answer
+    echo
+    echo "================ PLANNED CHANGES ================"
+    echo "Source (read only):       ${REMOTE_HOST}:${REMOTE_PORT:-3306}"
+    echo "Target (WILL BE CHANGED): ${LOCAL_HOST:-localhost}:${LOCAL_PORT:-3306}"
+    echo
+    for line in "${_cp_lines[@]}"; do echo "  $line"; done
+    echo "================================================="
+    echo
+
+    if [ "$DRY_RUN" = "true" ]; then
+        echo "DRY RUN: all safety checks passed. Nothing was changed."
+        exit 0
+    fi
+    if [ "$ASSUME_YES" = "true" ]; then
+        config_log "INFO" "Confirmation skipped (--yes)"
+        return 0
+    fi
+    if [ "${CI:-}" = "true" ]; then
+        config_log "INFO" "Confirmation skipped (CI=true)"
+        return 0
+    fi
+    if [ ! -t 0 ]; then
+        config_log "ERROR" "This run would replace the databases listed above, but there is no terminal to ask for confirmation."
+        config_log "ERROR" "Re-run with --yes to proceed non-interactively, or --dry-run to preview."
+        exit 1
+    fi
+    read -r -p "Type 'yes' to replace the databases listed above: " answer
+    if [ "$answer" != "yes" ]; then
+        config_log "ERROR" "Aborted: nothing was changed."
+        exit 1
+    fi
+    return 0
+}
+
+# Full pre-flight for whole-database syncs: guards + plan + confirmation.
+# Usage: plan_and_confirm_databases <databases_array_name>
+plan_and_confirm_databases() {
+    local -n _pd_dbs=$1
+    local -a src=() dst=() lines=()
+    local db t
+    for db in "${_pd_dbs[@]}"; do
+        t=$(get_local_database_name "$db")
+        src+=("$db"); dst+=("$t")
+    done
+    guard_plan src dst || { config_log "ERROR" "Safety checks failed. Nothing was changed."; exit 1; }
+    for i in "${!src[@]}"; do
+        if local_db_exists "${dst[$i]}"; then
+            lines+=("${src[$i]} -> ${dst[$i]}   [EXISTS: dropped and replaced; snapshot restored on failure]")
+        else
+            lines+=("${src[$i]} -> ${dst[$i]}   [new]")
+        fi
+    done
+    confirm_plan lines
+}
+
+# Full pre-flight for table syncs. Entries are "source_db:target_db:table".
+# Usage: plan_and_confirm_tables <table_list_array_name>
+plan_and_confirm_tables() {
+    local -n _pt_list=$1
+    local -a src=() dst=() lines=()
+    local e s d t
+    for e in "${_pt_list[@]}"; do
+        IFS=':' read -r s d t <<< "$e"
+        src+=("$s"); dst+=("$d")
+    done
+    guard_plan src dst || { config_log "ERROR" "Safety checks failed. Nothing was changed."; exit 1; }
+    for e in "${_pt_list[@]}"; do
+        IFS=':' read -r s d t <<< "$e"
+        if local_mysql -N -B "$d" -e 'SHOW TABLES;' 2>/dev/null | grep -Fxq -- "$t"; then
+            lines+=("$s.$t -> $d.$t   [EXISTS: replaced; snapshot restored on failure]")
+        else
+            lines+=("$s.$t -> $d.$t   [new]")
+        fi
+    done
+    confirm_plan lines
+}
+
 # === SAFE REPLACE HELPERS (no data loss on a failed import) ===
 # Return codes for replace_local_database / replace_local_table:
 #   0 = replaced and verified
@@ -493,6 +701,11 @@ replace_local_database() {
     local -a import_args=()
     local_import_args import_args
     : > "$err_file"
+
+    if is_protected_database "$db"; then
+        echo "Refusing to replace protected schema '$db'" >> "$err_file"
+        return 2
+    fi
 
     found=$(local_mysql -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='$(_sql_str "$db")'" 2>>"$err_file") || return 2
     [ "${found:-0}" -gt 0 ] && existed=1
@@ -550,6 +763,11 @@ replace_local_table() {
     local -a import_args=()
     local_import_args import_args
     : > "$err_file"
+
+    if is_protected_database "$db"; then
+        echo "Refusing to replace tables in protected schema '$db'" >> "$err_file"
+        return 2
+    fi
 
     if local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
         existed=1
@@ -609,3 +827,4 @@ export -f _cnf_escape _write_cnf cleanup_credentials init_credentials
 export -f remote_mysql local_mysql remote_mysqldump
 export -f sql_ident create_database_sql read_dump_options local_import_args
 export -f local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table
+export -f print_safety_usage parse_safety_args is_protected_database servers_are_same guard_plan local_db_exists confirm_plan plan_and_confirm_databases plan_and_confirm_tables
