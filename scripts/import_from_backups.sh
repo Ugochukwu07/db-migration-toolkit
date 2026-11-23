@@ -58,35 +58,13 @@ for SQL_FILE in "$BACKUP_DIR"/*.sql; do
 
     echo "Importing $DB_NAME into local database $LOCAL_DB_NAME..."
 
-    # Build drop database command
-    DROP_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    DROP_CMD="$DROP_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    DROP_CMD="$DROP_CMD -e 'DROP DATABASE IF EXISTS \`$LOCAL_DB_NAME\`'"
-    
-    eval "$DROP_CMD"
-    if [ $? -ne 0 ]; then
+    if ! local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$LOCAL_DB_NAME")"; then
         echo "❌ Failed to drop existing database $LOCAL_DB_NAME"
         rm "$TEMP_SQL_FILE"
         continue
     fi
 
-    # Build create database command
-    CREATE_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    CREATE_CMD="$CREATE_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    
-    # Build database creation SQL
-    CREATE_SQL="CREATE DATABASE \`$LOCAL_DB_NAME\`"
-    if [ -n "${CHARSET:-}" ]; then
-        CREATE_SQL="$CREATE_SQL CHARACTER SET ${CHARSET}"
-    fi
-    if [ -n "${COLLATION:-}" ]; then
-        CREATE_SQL="$CREATE_SQL COLLATE ${COLLATION}"
-    fi
-    
-    CREATE_CMD="$CREATE_CMD -e '$CREATE_SQL'"
-    
-    eval "$CREATE_CMD"
-    if [ $? -ne 0 ]; then
+    if ! local_mysql -e "$(create_database_sql "$LOCAL_DB_NAME")"; then
         echo "❌ Failed to create local database $LOCAL_DB_NAME"
         rm "$TEMP_SQL_FILE"
         continue
@@ -95,6 +73,7 @@ for SQL_FILE in "$BACKUP_DIR"/*.sql; do
     # Create a temporary wrapper SQL file that disables binary logging
     WRAPPER_SQL_FILE="${TEMP_SQL_FILE}.wrapper"
     echo "SET SESSION sql_log_bin=0;" > "$WRAPPER_SQL_FILE"
+    echo "SET SESSION foreign_key_checks=0;" >> "$WRAPPER_SQL_FILE"
     
     # Set SQL mode if configured
     if [ -n "${SQL_MODE:-}" ]; then
@@ -105,10 +84,7 @@ for SQL_FILE in "$BACKUP_DIR"/*.sql; do
     echo "SET SESSION sql_log_bin=1;" >> "$WRAPPER_SQL_FILE"
 
     # Import dump into local DB
-    IMPORT_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    IMPORT_CMD="$IMPORT_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\" \"$LOCAL_DB_NAME\""
-    
-    eval "$IMPORT_CMD" < "$WRAPPER_SQL_FILE"
+    local_mysql "$LOCAL_DB_NAME" < "$WRAPPER_SQL_FILE"
     IMPORT_STATUS=$?
 
     rm "$TEMP_SQL_FILE" "$WRAPPER_SQL_FILE"
@@ -119,13 +95,9 @@ for SQL_FILE in "$BACKUP_DIR"/*.sql; do
         echo "✅ $DB_NAME imported into $LOCAL_DB_NAME successfully."
         
         # Verify import by counting tables
-        TABLE_COUNT_CMD="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-        TABLE_COUNT_CMD="$TABLE_COUNT_CMD --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-        TABLE_COUNT_CMD="$TABLE_COUNT_CMD \"$LOCAL_DB_NAME\" -e 'SHOW TABLES;' 2>/dev/null | wc -l"
-        
-        table_count=$(eval "$TABLE_COUNT_CMD")
-        if [ "${table_count:-0}" -gt 1 ]; then
-            echo "   Import verified: $((table_count - 1)) tables found"
+        table_count=$(local_mysql -N -B "$LOCAL_DB_NAME" -e 'SHOW TABLES;' 2>/dev/null | wc -l)
+        if [ "${table_count:-0}" -gt 0 ]; then
+            echo "   Import verified: $table_count tables found"
         fi
     fi
 done

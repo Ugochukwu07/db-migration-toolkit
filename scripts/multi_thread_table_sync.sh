@@ -96,31 +96,20 @@ sync_dump_table() {
     # Clear previous error log
     > "$error_file"
     
-    # Get mysqldump options for table sync from configuration
-    local dump_options=$(get_mysqldump_table_options)
-    
-    # Build mysqldump command for specific table
-    local dump_cmd="mysqldump -h\"$REMOTE_HOST\" -P\"${REMOTE_PORT:-3306}\" -u\"$REMOTE_USER\" -p\"$REMOTE_PASS\""
-    dump_cmd="$dump_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\" --single-transaction"
-    dump_cmd="$dump_cmd $dump_options \"$DB\" \"$TABLE\""
+    # Get mysqldump options for table sync from configuration (array, no eval)
+    local -a dump_opts=()
+    read_dump_options dump_opts table
     
     if is_debug_mode; then
-        thread_log "DEBUG" "$DB" "$TABLE" "Dump command: $dump_cmd"
+        thread_log "DEBUG" "$DB" "$TABLE" "Dump command: mysqldump [remote connection] --single-transaction ${dump_opts[*]} $DB $TABLE"
     fi
     
     # Execute dump command
-    eval "$dump_cmd" > "$backup_file" 2>"$error_file"
-
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 3 | tr '\n' ' ')
-        # Filter out password warnings (they're not real errors)
-        if echo "$error_msg" | grep -q "Using a password on the command line interface can be insecure" && [ -s "$backup_file" ]; then
-            thread_log "WARN" "$DB" "$TABLE" "Dump completed with password warning (attempt $attempt)"
-        else
-            thread_log "ERROR" "$DB" "$TABLE" "Dump failed (attempt $attempt): ${error_msg}"
-            echo "DUMP_ERROR:$DB:$TABLE:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-            return 1
-        fi
+    if ! remote_mysqldump --single-transaction "${dump_opts[@]}" "$DB" "$TABLE" > "$backup_file" 2>"$error_file"; then
+        local error_msg=$(head -n 3 "$error_file" 2>/dev/null | tr '\n' ' ')
+        thread_log "ERROR" "$DB" "$TABLE" "Dump failed (attempt $attempt): ${error_msg}"
+        echo "DUMP_ERROR:$DB:$TABLE:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
+        return 1
     fi
 
     # Verify dump file was created and has content
@@ -138,7 +127,7 @@ sync_dump_table() {
     fi
 
     local dump_size=$(du -h "$backup_file" | cut -f1)
-    local row_count=$(grep -c "INSERT INTO" "$backup_file" 2>/dev/null || echo "0")
+    local row_count=$(grep -c "INSERT INTO" "$backup_file" 2>/dev/null || true)
     thread_log "SUCCESS" "$DB" "$TABLE" "Table dump completed successfully (Size: $dump_size, Inserts: $row_count, attempt $attempt)"
     rm -f "$error_file"  # Clean up error file on success
     return 0
@@ -164,80 +153,30 @@ sync_import_table() {
     > "$error_file"
     
     # Ensure local database exists
-    local create_db_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    create_db_cmd="$create_db_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    
-    # Build database creation command
-    local db_create_sql="CREATE DATABASE IF NOT EXISTS \`$local_db_name\`"
-    if [ -n "${CHARSET:-}" ]; then
-        db_create_sql="$db_create_sql CHARACTER SET ${CHARSET}"
-    fi
-    if [ -n "${COLLATION:-}" ]; then
-        db_create_sql="$db_create_sql COLLATE ${COLLATION}"
-    fi
-    
-    create_db_cmd="$create_db_cmd -e '$db_create_sql'"
-    
-    eval "$create_db_cmd" 2>"$error_file"
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 2 | tr '\n' ' ')
+    if ! local_mysql -e "$(create_database_sql "$local_db_name" true)" 2>"$error_file"; then
+        local error_msg=$(head -n 2 "$error_file" 2>/dev/null | tr '\n' ' ')
         thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Failed to create/access local database (attempt $attempt): ${error_msg}"
         echo "IMPORT_ERROR:$SOURCE_DB:$TABLE:attempt_$attempt:Database creation failed - ${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
-    # Drop existing table if configured to do so
-    if should_drop_existing_tables; then
-        thread_log "INFO" "$SOURCE_DB" "$TABLE" "Dropping existing table $TABLE (if exists)..."
-        local drop_table_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-        drop_table_cmd="$drop_table_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-        drop_table_cmd="$drop_table_cmd \"$local_db_name\" -e 'DROP TABLE IF EXISTS \`$TABLE\`'"
-        
-        eval "$drop_table_cmd" 2>"$error_file"
-        if [ $? -ne 0 ]; then
-            local error_msg=$(cat "$error_file" 2>/dev/null | head -n 2 | tr '\n' ' ')
-            thread_log "WARN" "$SOURCE_DB" "$TABLE" "Failed to drop existing table (attempt $attempt): ${error_msg}"
-            # Continue anyway, as the table might not exist
-        fi
-    fi
+    # Replace the table: existing data is snapshotted first and restored if the import fails
+    local safety_file="$BACKUP_DIR/pre-sync_${SOURCE_DB}_${TABLE}-${TIMESTAMP}.sql"
+    local drop_first=false
+    should_drop_existing_tables && drop_first=true
     
-    # Import table dump into local DB
-    local import_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    import_cmd="$import_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    
-    # Set SQL mode if configured
-    if [ -n "${SQL_MODE:-}" ]; then
-        import_cmd="$import_cmd --init-command=\"SET SESSION sql_mode='${SQL_MODE}'\""
-    fi
-    
-    import_cmd="$import_cmd \"$local_db_name\""
-    
-    eval "$import_cmd" < "$backup_file" 2>"$error_file"
-    if [ $? -ne 0 ]; then
-        local error_msg=$(cat "$error_file" 2>/dev/null | head -n 3 | tr '\n' ' ')
-        thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Import failed (attempt $attempt): ${error_msg}"
+    replace_local_table "$local_db_name" "$TABLE" "$backup_file" "$safety_file" "$error_file" "$drop_first"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        local error_msg=$(tail -n 4 "$error_file" 2>/dev/null | tr '\n' ' ')
+        thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Import failed (rc=$rc, attempt $attempt): ${error_msg}"
         echo "IMPORT_ERROR:$SOURCE_DB:$TABLE:attempt_$attempt:${error_msg}:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
         return 1
     fi
     
-    # Verify import by checking if table exists and has expected structure
-    local table_check_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    table_check_cmd="$table_check_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    table_check_cmd="$table_check_cmd \"$local_db_name\" -e \"SHOW TABLES LIKE '$TABLE';\" 2>/dev/null | wc -l"
-    
-    local table_exists=$(eval "$table_check_cmd")
-    if [ "${table_exists:-0}" -le 1 ]; then
-        thread_log "ERROR" "$SOURCE_DB" "$TABLE" "Import verification failed - table not found after import (attempt $attempt)"
-        echo "IMPORT_ERROR:$SOURCE_DB:$TABLE:attempt_$attempt:Table not found after import:$TIMESTAMP" >> "$TMP_DIR/error_log-$TIMESTAMP.tmp"
-        return 1
-    fi
-    
     # Get row count for verification
-    local row_count_cmd="mysql -h\"${LOCAL_HOST:-localhost}\" -P\"${LOCAL_PORT:-3306}\" -u\"$LOCAL_USER\" -p\"$LOCAL_PASS\""
-    row_count_cmd="$row_count_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    row_count_cmd="$row_count_cmd \"$local_db_name\" -e \"SELECT COUNT(*) FROM \\\`$TABLE\\\`;\" 2>/dev/null | tail -n 1"
-    
-    local row_count=$(eval "$row_count_cmd")
+    local row_count
+    row_count=$(local_mysql -N -B "$local_db_name" -e "SELECT COUNT(*) FROM $(sql_ident "$TABLE");" 2>/dev/null)
     thread_log "SUCCESS" "$SOURCE_DB" "$TABLE" "Table import completed successfully (${row_count:-unknown} rows, attempt $attempt)"
     rm -f "$error_file"  # Clean up error file on success
     return 0
@@ -273,14 +212,8 @@ discover_tables() {
     
     log "INFO" "Discovering tables in database: $DB"
     
-    # Get list of tables from remote database
-    local discover_cmd="mysql -h\"$REMOTE_HOST\" -P\"${REMOTE_PORT:-3306}\" -u\"$REMOTE_USER\" -p\"$REMOTE_PASS\""
-    discover_cmd="$discover_cmd --connect-timeout=\"${MYSQL_CONNECT_TIMEOUT:-60}\""
-    discover_cmd="$discover_cmd -e \"USE $DB; SHOW TABLES;\" 2>/dev/null | tail -n +2"
-    
-    eval "$discover_cmd" > "$tables_file"
-    
-    if [ $? -ne 0 ] || [ ! -s "$tables_file" ]; then
+    # Get list of tables from remote database (-N: no header row)
+    if ! remote_mysql -N -B "$DB" -e "SHOW TABLES;" > "$tables_file" 2>/dev/null || [ ! -s "$tables_file" ]; then
         log "ERROR" "Failed to discover tables in database: $DB"
         return 1
     fi
@@ -471,12 +404,14 @@ SYNC_END_TIME=$(date +%s)
 TOTAL_DURATION=$((SYNC_END_TIME - SYNC_START_TIME))
 
 # === FINAL REPORT ===
+successful=0
+failed=0
 log "INFO" "All table synchronization processes completed"
 log "INFO" "Total execution time: ${TOTAL_DURATION}s"
 
 if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
-    successful=$(grep -c "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-    failed=$(grep -c "^FAILED:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
+    successful=$(grep -c "^SUCCESS:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || true)
+    failed=$(grep -c "^FAILED:" "$TMP_DIR/sync_status-$TIMESTAMP.tmp" 2>/dev/null || true)
     
     log "INFO" "FINAL SUMMARY:"
     log "INFO" "  ✓ Successful: $successful tables"
@@ -503,8 +438,8 @@ if [ -f "$TMP_DIR/sync_status-$TIMESTAMP.tmp" ]; then
     # Show error summary if errors occurred
     if [ -f "$TMP_DIR/error_log-$TIMESTAMP.tmp" ]; then
         log "INFO" "Error Summary:"
-        dump_errors=$(grep -c "^DUMP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
-        import_errors=$(grep -c "^IMPORT_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || echo "0")
+        dump_errors=$(grep -c "^DUMP_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
+        import_errors=$(grep -c "^IMPORT_ERROR:" "$TMP_DIR/error_log-$TIMESTAMP.tmp" 2>/dev/null || true)
         
         log "INFO" "  - Dump errors: $dump_errors"
         log "INFO" "  - Import errors: $import_errors"
@@ -529,7 +464,7 @@ fi
 
 # Send notifications if configured
 if [ "${ENABLE_EMAIL_NOTIFICATIONS:-false}" = "true" ] && command -v mail >/dev/null 2>&1; then
-    local status_msg="Multi-threaded table synchronization completed"
+    status_msg="Multi-threaded table synchronization completed"
     if [ "$failed" -gt 0 ]; then
         status_msg="$status_msg with $failed failures"
     fi
@@ -538,7 +473,7 @@ if [ "${ENABLE_EMAIL_NOTIFICATIONS:-false}" = "true" ] && command -v mail >/dev/
 fi
 
 if [ "${ENABLE_WEBHOOK_NOTIFICATIONS:-false}" = "true" ] && [ -n "${WEBHOOK_URL:-}" ] && command -v curl >/dev/null 2>&1; then
-    local webhook_data="{\"text\":\"Multi-threaded table synchronization completed. Success: $successful, Failed: $failed\"}"
+    webhook_data="{\"text\":\"Multi-threaded table synchronization completed. Success: $successful, Failed: $failed\"}"
     curl -X POST -H "Content-Type: application/json" \
          -d "$webhook_data" \
          "${WEBHOOK_URL}" >/dev/null 2>&1 || true

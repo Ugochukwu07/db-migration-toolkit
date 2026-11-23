@@ -191,6 +191,14 @@ validate_config() {
         fi
     done
     
+    # CHARSET / COLLATION are interpolated into SQL, so restrict them
+    for var in CHARSET COLLATION; do
+        if [ -n "${!var:-}" ] && ! [[ "${!var}" =~ ^[A-Za-z0-9_]+$ ]]; then
+            config_log "ERROR" "$var may only contain letters, digits and underscores"
+            ((validation_errors++))
+        fi
+    done
+    
     if [ $validation_errors -eq 0 ]; then
         config_log "INFO" "Configuration validation passed"
         return 0
@@ -208,9 +216,7 @@ test_database_connections() {
     
     # Test remote database connection
     config_log "INFO" "Testing remote database connection..."
-    if mysql -h"${REMOTE_HOST}" -P"${REMOTE_PORT:-3306}" -u"${REMOTE_USER}" -p"${REMOTE_PASS}" \
-             --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" \
-             -e "SELECT VERSION();" >/dev/null 2>&1; then
+    if remote_mysql -e "SELECT VERSION();" >/dev/null 2>&1; then
         config_log "INFO" "Remote database connection successful"
     else
         config_log "ERROR" "Remote database connection failed"
@@ -219,9 +225,7 @@ test_database_connections() {
     
     # Test local database connection
     config_log "INFO" "Testing local database connection..."
-    if mysql -h"${LOCAL_HOST:-localhost}" -P"${LOCAL_PORT:-3306}" -u"${LOCAL_USER}" -p"${LOCAL_PASS}" \
-             --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" \
-             -e "SELECT VERSION();" >/dev/null 2>&1; then
+    if local_mysql -e "SELECT VERSION();" >/dev/null 2>&1; then
         config_log "INFO" "Local database connection successful"
     else
         config_log "ERROR" "Local database connection failed"
@@ -289,6 +293,11 @@ init_config() {
         fi
     fi
     
+    # Create private credential files (no passwords on command lines)
+    if ! init_credentials; then
+        return 1
+    fi
+    
     # Test database connections if enabled and not validation-only
     if [ "$validate_only" != "true" ] && [ "${TEST_CONNECTIONS:-true}" = "true" ]; then
         if ! test_database_connections; then
@@ -339,6 +348,249 @@ should_drop_existing_tables() {
     [ "${DROP_EXISTING_TABLE:-true}" = "true" ]
 }
 
+# === SAFE MYSQL INVOCATION HELPERS ===
+# Credentials are never placed on a command line (visible in `ps`) and
+# commands are never built as strings for eval. Instead each connection gets
+# a private (mode 600) option file passed with --defaults-extra-file, and all
+# arguments are passed as properly quoted words.
+
+_CRED_DIR=""
+
+# Escape a value for use inside a double-quoted option-file string
+_cnf_escape() {
+    local v="$1"
+    v="${v//\\/\\\\}"
+    v="${v//\"/\\\"}"
+    printf '%s' "$v"
+}
+
+# Write a client option file: _write_cnf <file> <host> <port> <user> <password>
+_write_cnf() {
+    local file="$1" host="$2" port="$3" user="$4" pass="$5"
+    case "$host$port$user$pass" in
+        *$'\n'*|*$'\r'*)
+            config_log "ERROR" "Credentials must not contain newline characters"
+            return 1
+            ;;
+    esac
+    (
+        umask 077
+        {
+            echo "[client]"
+            echo "host=\"$(_cnf_escape "$host")\""
+            echo "port=\"$(_cnf_escape "$port")\""
+            echo "user=\"$(_cnf_escape "$user")\""
+            echo "password=\"$(_cnf_escape "$pass")\""
+        } > "$file"
+    )
+}
+
+# Remove credential files (also runs on exit)
+cleanup_credentials() {
+    if [ -n "$_CRED_DIR" ] && [ -d "$_CRED_DIR" ]; then
+        rm -rf "$_CRED_DIR"
+    fi
+    _CRED_DIR=""
+}
+
+# Create credential files for the remote and local servers.
+# Must be called once in the main process BEFORE any background jobs start.
+init_credentials() {
+    cleanup_credentials
+    _CRED_DIR=$(umask 077 && mktemp -d "${TMPDIR:-/tmp}/dbmig-cred.XXXXXX") || {
+        config_log "ERROR" "Could not create a private directory for credentials"
+        return 1
+    }
+    REMOTE_CNF="$_CRED_DIR/remote.cnf"
+    LOCAL_CNF="$_CRED_DIR/local.cnf"
+    _write_cnf "$REMOTE_CNF" "$REMOTE_HOST" "${REMOTE_PORT:-3306}" "$REMOTE_USER" "$REMOTE_PASS" || return 1
+    _write_cnf "$LOCAL_CNF" "${LOCAL_HOST:-localhost}" "${LOCAL_PORT:-3306}" "$LOCAL_USER" "$LOCAL_PASS" || return 1
+    export REMOTE_CNF LOCAL_CNF
+    trap cleanup_credentials EXIT
+    trap 'cleanup_credentials; exit 130' INT
+    trap 'cleanup_credentials; exit 143' TERM
+}
+
+# Run mysql / mysqldump against the remote or local server.
+remote_mysql() {
+    mysql --defaults-extra-file="$REMOTE_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+local_mysql() {
+    mysql --defaults-extra-file="$LOCAL_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+remote_mysqldump() {
+    mysqldump --defaults-extra-file="$REMOTE_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+
+# Quote an SQL identifier (database/table name) with backticks
+sql_ident() {
+    local v="${1//\`/\`\`}"
+    printf '`%s`' "$v"
+}
+
+# CREATE DATABASE statement honouring CHARSET / COLLATION (validated elsewhere)
+create_database_sql() {
+    local name="$1" if_not_exists="${2:-false}" sql="CREATE DATABASE "
+    [ "$if_not_exists" = "true" ] && sql+="IF NOT EXISTS "
+    sql+="$(sql_ident "$name")"
+    [ -n "${CHARSET:-}" ] && sql+=" CHARACTER SET ${CHARSET}"
+    [ -n "${COLLATION:-}" ] && sql+=" COLLATE ${COLLATION}"
+    printf '%s' "$sql"
+}
+
+# Split the configured mysqldump option string into an array (no eval, no globbing)
+# Usage: read_dump_options <array_name> <table|db>
+read_dump_options() {
+    local -n _opts_ref=$1
+    local raw
+    if [ "${2:-db}" = "table" ]; then raw=$(get_mysqldump_table_options); else raw=$(get_mysqldump_options); fi
+    read -r -a _opts_ref <<< "$raw"
+    # mysqldump 8.x queries information_schema.COLUMN_STATISTICS, which 5.7
+    # servers lack. Disable it when the client supports the flag (it is
+    # unknown to 5.7 and MariaDB clients, so only add it when advertised).
+    if mysqldump --help 2>/dev/null | grep -q -- '--column-statistics'; then
+        case " $raw " in *" --column-statistics"*) ;; *) _opts_ref+=(--column-statistics=0) ;; esac
+    fi
+}
+
+# Extra mysql args for imports. Foreign key checks are disabled for the import
+# session (tables are imported independently/in parallel, so a child table may
+# arrive before its parent); sql_mode is applied when configured.
+# Usage: local_import_args <array_name>
+local_import_args() {
+    local -n _args_ref=$1
+    local init="SET SESSION foreign_key_checks=0"
+    if [ -n "${SQL_MODE:-}" ]; then
+        init+=", sql_mode='${SQL_MODE//\'/\'\'}'"
+    fi
+    _args_ref=(--init-command="$init")
+}
+
+# === SAFE REPLACE HELPERS (no data loss on a failed import) ===
+# Return codes for replace_local_database / replace_local_table:
+#   0 = replaced and verified
+#   1 = import/verification failed; previous data was restored (or nothing existed)
+#   2 = aborted before touching anything (could not snapshot existing data)
+#   3 = import failed AND restore failed; the pre-sync snapshot is kept on disk
+
+local_mysqldump() {
+    mysqldump --defaults-extra-file="$LOCAL_CNF" --connect-timeout="${MYSQL_CONNECT_TIMEOUT:-60}" "$@"
+}
+
+# Escape a value for a single-quoted SQL string literal
+_sql_str() { printf '%s' "${1//\'/\'\'}"; }
+
+# Remove the pre-sync snapshot unless the user asked to keep it
+_discard_safety() {
+    [ "${KEEP_PRE_SYNC_BACKUP:-false}" = "true" ] || rm -f -- "${1:?safety file required}"
+}
+
+# Replace a local database with the contents of a dump, rolling back on failure.
+# Usage: replace_local_database <local_db> <dump_file> <safety_file> <error_file>
+replace_local_database() {
+    local db="${1:?}" dump_file="${2:?}" safety_file="${3:?}" err_file="${4:?}"
+    local existed=0 found
+    local -a import_args=()
+    local_import_args import_args
+    : > "$err_file"
+
+    found=$(local_mysql -N -B -e "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name='$(_sql_str "$db")'" 2>>"$err_file") || return 2
+    [ "${found:-0}" -gt 0 ] && existed=1
+
+    # 1. Snapshot the current local database so a failure cannot lose it
+    if [ "$existed" -eq 1 ]; then
+        if ! ( umask 077; local_mysqldump --single-transaction --routines --triggers --events --set-gtid-purged=OFF "$db" > "$safety_file" ) 2>>"$err_file"; then
+            echo "Could not snapshot existing database '$db'; leaving it untouched" >> "$err_file"
+            rm -f -- "$safety_file"
+            return 2
+        fi
+    fi
+
+    # 2. Replace
+    local ok=1
+    local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file" || ok=0
+    [ $ok -eq 1 ] && { local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" || ok=0; }
+    [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
+
+    # 3. Verify: if the dump defines tables, they must exist now
+    if [ $ok -eq 1 ] && grep -q "CREATE TABLE" "$dump_file"; then
+        local tables
+        tables=$(local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | wc -l)
+        if [ "${tables:-0}" -lt 1 ]; then
+            echo "Import verification failed: no tables found in '$db'" >> "$err_file"
+            ok=0
+        fi
+    fi
+
+    if [ $ok -eq 1 ]; then
+        _discard_safety "$safety_file"
+        return 0
+    fi
+
+    # 4. Roll back
+    local_mysql -e "DROP DATABASE IF EXISTS $(sql_ident "$db")" 2>>"$err_file"
+    if [ "$existed" -eq 1 ]; then
+        if local_mysql -e "$(create_database_sql "$db")" 2>>"$err_file" \
+           && local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
+            echo "Rolled back: previous contents of '$db' restored" >> "$err_file"
+            _discard_safety "$safety_file"
+            return 1
+        fi
+        echo "ROLLBACK FAILED for '$db'. Previous data is preserved in: $safety_file" >> "$err_file"
+        return 3
+    fi
+    return 1
+}
+
+# Replace one local table with the contents of a dump, rolling back on failure.
+# Usage: replace_local_table <db> <table> <dump_file> <safety_file> <error_file> <drop_first:true|false>
+replace_local_table() {
+    local db="${1:?}" table="${2:?}" dump_file="${3:?}" safety_file="${4:?}" err_file="${5:?}" drop_first="${6:-true}"
+    local existed=0
+    local -a import_args=()
+    local_import_args import_args
+    : > "$err_file"
+
+    if local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
+        existed=1
+    fi
+
+    if [ "$existed" -eq 1 ]; then
+        if ! ( umask 077; local_mysqldump --single-transaction --triggers --set-gtid-purged=OFF "$db" "$table" > "$safety_file" ) 2>>"$err_file"; then
+            echo "Could not snapshot existing table '$db.$table'; leaving it untouched" >> "$err_file"
+            rm -f -- "$safety_file"
+            return 2
+        fi
+    fi
+
+    local ok=1
+    if [ "$drop_first" = "true" ]; then
+        local_mysql "$db" -e "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file" || ok=0
+    fi
+    [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
+    if [ $ok -eq 1 ] && ! local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
+        echo "Import verification failed: table '$table' not found after import" >> "$err_file"
+        ok=0
+    fi
+
+    if [ $ok -eq 1 ]; then
+        _discard_safety "$safety_file"
+        return 0
+    fi
+
+    local_mysql "$db" -e "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file"
+    if [ "$existed" -eq 1 ]; then
+        if local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
+            echo "Rolled back: previous contents of '$db.$table' restored" >> "$err_file"
+            _discard_safety "$safety_file"
+            return 1
+        fi
+        echo "ROLLBACK FAILED for '$db.$table'. Previous data is preserved in: $safety_file" >> "$err_file"
+        return 3
+    fi
+    return 1
+}
+
 # Export functions for use in other scripts
 export -f config_log
 export -f load_config
@@ -353,3 +605,7 @@ export -f get_mysqldump_options
 export -f get_mysqldump_table_options
 export -f is_debug_mode
 export -f should_drop_existing_tables
+export -f _cnf_escape _write_cnf cleanup_credentials init_credentials
+export -f remote_mysql local_mysql remote_mysqldump
+export -f sql_ident create_database_sql read_dump_options local_import_args
+export -f local_mysqldump _sql_str _discard_safety replace_local_database replace_local_table
