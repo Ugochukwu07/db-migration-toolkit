@@ -372,3 +372,21 @@ Contributors will be:
 - **Acknowledged in documentation**
 
 Thank you for contributing to make the Database Migration Toolkit better for everyone! 🚀
+
+## Integration tests
+
+`tests/integration/run.sh` runs the toolkit against two real MySQL servers
+(a "remote" source and a "local" target) and checks row counts, table
+checksums, views, routines, triggers, hostile passwords and rollback on a
+failed import. CI runs it against MySQL 5.7 and 8.0.
+
+To run it locally you need Docker and a MySQL client:
+
+```bash
+docker run -d --name mysql-remote -e MYSQL_ROOT_PASSWORD=ci_root_password -p 3306:3306 mysql:8.0
+docker run -d --name mysql-local  -e MYSQL_ROOT_PASSWORD=ci_root_password -p 3307:3306 mysql:8.0
+MYSQL_ROOT_PASSWORD=ci_root_password ./tests/integration/run.sh
+```
+
+The tests drop and create databases on both servers, so only point them at
+disposable instances.

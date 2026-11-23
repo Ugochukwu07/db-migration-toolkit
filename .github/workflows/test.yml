@@ -5,45 +5,111 @@ on:
     branches: [ master, main ]
   pull_request:
     branches: [ master, main ]
+  workflow_dispatch:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  test:
+  lint:
+    name: Lint & static checks
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bash syntax check
+        run: |
+          for f in scripts/*.sh setup.sh install.sh tests/integration/*.sh; do
+            bash -n "$f" || { echo "::error file=$f::syntax error"; exit 1; }
+          done
+
+      - name: Scripts are executable
+        run: |
+          status=0
+          for f in scripts/*.sh setup.sh tests/integration/run.sh; do
+            [ "$f" = "scripts/config_loader.sh" ] && continue   # sourced, not executed
+            [ -x "$f" ] || { echo "::error file=$f::not executable"; status=1; }
+          done
+          exit $status
+
+      - name: No eval or password-on-command-line in scripts
+        run: |
+          if grep -nE '(^|[^[:alnum:]_])eval[[:space:]]|-p"\$' scripts/*.sh; then
+            echo "::error::eval / -p\"\$PASS\" must not be used; use the helpers in config_loader.sh"
+            exit 1
+          fi
+
+      # Advisory for now: the existing scripts have not been cleaned up for shellcheck yet.
+      - name: ShellCheck (errors only, advisory)
+        continue-on-error: true
+        run: shellcheck -S error scripts/*.sh setup.sh tests/integration/run.sh
+
+  integration:
+    name: Integration (MySQL ${{ matrix.mysql-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: lint
     strategy:
+      fail-fast: false
       matrix:
         mysql-version: ['5.7', '8.0']
-        
+
+    # Two real servers of the same version: "remote" (source) and "local" (target)
     services:
-      mysql:
+      mysql-remote:
         image: mysql:${{ matrix.mysql-version }}
         env:
-          MYSQL_ROOT_PASSWORD: test_password
-          MYSQL_DATABASE: test_db
+          MYSQL_ROOT_PASSWORD: ci_root_password
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping --silent"
-          --health-interval=10s
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci_root_password --silent"
+          --health-interval=5s
           --health-timeout=5s
-          --health-retries=3
+          --health-retries=20
+      mysql-local:
+        image: mysql:${{ matrix.mysql-version }}
+        env:
+          MYSQL_ROOT_PASSWORD: ci_root_password
+        ports:
+          - 3307:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -pci_root_password --silent"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        
+      - uses: actions/checkout@v4
+
       - name: Install MySQL client
         run: |
           sudo apt-get update
           sudo apt-get install -y mysql-client
-          
-      - name: Wait for MySQL to be ready
+          mysql --version
+          mysqldump --version
+
+      - name: Run integration tests
+        env:
+          REMOTE_PORT: 3306
+          LOCAL_PORT: 3307
+          MYSQL_ROOT_PASSWORD: ci_root_password
+        run: ./tests/integration/run.sh
+
+  smoke:
+    name: Setup validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install MySQL client
         run: |
-          until mysqladmin ping -h 127.0.0.1 -u root -ptest_password --silent; do
-            echo 'Waiting for MySQL...'
-            sleep 1
-          done
-          
+          sudo apt-get update
+          sudo apt-get install -y mysql-client
+
       - name: Setup test configuration
         run: |
           cp config/config.env.example config/config.env
@@ -52,62 +118,13 @@ jobs:
           sed -i 's/your-remote-password/test_password/g' config/config.env
           sed -i 's/your-local-mysql-password/test_password/g' config/config.env
           sed -i 's/database1,database2,database3/test_db/g' config/config.env
-          
-      - name: Make scripts executable
-        run: |
-          chmod +x scripts/*.sh
-          chmod +x setup.sh
-          
+
       - name: Run setup validation
         run: |
+          chmod +x scripts/*.sh setup.sh
           ./setup.sh --test
-          
-      - name: Test configuration loading
+
+      - name: Configuration loads
         run: |
           source scripts/config_loader.sh
-          if load_config "./config/config.env"; then
-            echo "✅ Configuration loading test passed"
-          else
-            echo "❌ Configuration loading test failed"
-            exit 1
-          fi
-          
-      - name: Test database connection
-        run: |
-          mysql -h 127.0.0.1 -u root -ptest_password -e "SELECT VERSION();"
-          
-      - name: Create test data
-        run: |
-          mysql -h 127.0.0.1 -u root -ptest_password test_db -e "
-            CREATE TABLE test_table (
-              id INT AUTO_INCREMENT PRIMARY KEY,
-              name VARCHAR(100),
-              created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-            INSERT INTO test_table (name) VALUES ('test1'), ('test2'), ('test3');
-          "
-          
-      - name: Test simple sync (dry run simulation)
-        run: |
-          # Test configuration validation
-          source config/config.env
-          echo "Testing with database: $SYNC_DATABASES"
-          echo "Remote host: $REMOTE_HOST"
-          echo "✅ Basic sync test passed"
-          
-      - name: Verify scripts exist and are executable
-        run: |
-          for script in scripts/*.sh; do
-            if [ -x "$script" ]; then
-              echo "✅ $script is executable"
-            else
-              echo "❌ $script is not executable"
-              exit 1
-            fi
-          done
-          
-      - name: Test help/usage output
-        run: |
-          # Test that scripts can show help without failing
-          timeout 10s ./setup.sh --help || true
-          echo "✅ Scripts help test completed"
+          load_config "./config/config.env"

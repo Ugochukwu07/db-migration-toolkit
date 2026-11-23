@@ -55,6 +55,7 @@ declare -a DUMP_OPTS=()
 read_dump_options DUMP_OPTS db
 log "INFO" "Using mysqldump options: ${DUMP_OPTS[*]}"
 
+FAILED_DBS=()
 for DB in "${DATABASES[@]}"; do
     log "INFO" "Processing database: $DB"
     log "INFO" "Step 1/3: Dumping $DB from remote server..."
@@ -75,6 +76,7 @@ for DB in "${DATABASES[@]}"; do
             log "ERROR" "Error details: $(head -n 3 "$BACKUP_DIR/${DB}_dump_error.log" | tr '\n' ' ')"
         fi
         log "WARN" "Skipping $DB and continuing with next database"
+        FAILED_DBS+=("$DB")
         continue
     fi
 
@@ -104,6 +106,7 @@ for DB in "${DATABASES[@]}"; do
         esac
         log "ERROR" "Error details: $(tail -n 4 "$IMPORT_ERR" | tr '\n' ' ')"
         log "WARN" "Database $DB synchronization incomplete"
+        FAILED_DBS+=("$DB")
     fi
     
     log "INFO" "Finished processing database: $DB -> $LOCAL_DB_NAME"
@@ -134,3 +137,8 @@ if [ "${ENABLE_WEBHOOK_NOTIFICATIONS:-false}" = "true" ] && [ -n "${WEBHOOK_URL:
 fi
 
 log "INFO" "Check the logs above for any errors or warnings"
+
+if [ ${#FAILED_DBS[@]} -gt 0 ]; then
+    log "ERROR" "${#FAILED_DBS[@]} database(s) failed: ${FAILED_DBS[*]}"
+    exit 1
+fi

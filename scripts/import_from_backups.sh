@@ -73,6 +73,7 @@ for SQL_FILE in "$BACKUP_DIR"/*.sql; do
     # Create a temporary wrapper SQL file that disables binary logging
     WRAPPER_SQL_FILE="${TEMP_SQL_FILE}.wrapper"
     echo "SET SESSION sql_log_bin=0;" > "$WRAPPER_SQL_FILE"
+    echo "SET SESSION foreign_key_checks=0;" >> "$WRAPPER_SQL_FILE"
     
     # Set SQL mode if configured
     if [ -n "${SQL_MODE:-}" ]; then

@@ -445,15 +445,25 @@ read_dump_options() {
     local raw
     if [ "${2:-db}" = "table" ]; then raw=$(get_mysqldump_table_options); else raw=$(get_mysqldump_options); fi
     read -r -a _opts_ref <<< "$raw"
+    # mysqldump 8.x queries information_schema.COLUMN_STATISTICS, which 5.7
+    # servers lack. Disable it when the client supports the flag (it is
+    # unknown to 5.7 and MariaDB clients, so only add it when advertised).
+    if mysqldump --help 2>/dev/null | grep -q -- '--column-statistics'; then
+        case " $raw " in *" --column-statistics"*) ;; *) _opts_ref+=(--column-statistics=0) ;; esac
+    fi
 }
 
-# Extra mysql args for imports (sql_mode). Usage: local_import_args <array_name>
+# Extra mysql args for imports. Foreign key checks are disabled for the import
+# session (tables are imported independently/in parallel, so a child table may
+# arrive before its parent); sql_mode is applied when configured.
+# Usage: local_import_args <array_name>
 local_import_args() {
     local -n _args_ref=$1
-    _args_ref=()
+    local init="SET SESSION foreign_key_checks=0"
     if [ -n "${SQL_MODE:-}" ]; then
-        _args_ref+=(--init-command="SET SESSION sql_mode='${SQL_MODE//\'/\'\'}'")
+        init+=", sql_mode='${SQL_MODE//\'/\'\'}'"
     fi
+    _args_ref=(--init-command="$init")
 }
 
 # === SAFE REPLACE HELPERS (no data loss on a failed import) ===
@@ -555,7 +565,7 @@ replace_local_table() {
 
     local ok=1
     if [ "$drop_first" = "true" ]; then
-        local_mysql "$db" -e "DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file" || ok=0
+        local_mysql "$db" -e "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file" || ok=0
     fi
     [ $ok -eq 1 ] && { local_mysql "${import_args[@]}" "$db" < "$dump_file" 2>>"$err_file" || ok=0; }
     if [ $ok -eq 1 ] && ! local_mysql -N -B "$db" -e 'SHOW TABLES;' 2>>"$err_file" | grep -Fxq -- "$table"; then
@@ -568,7 +578,7 @@ replace_local_table() {
         return 0
     fi
 
-    local_mysql "$db" -e "DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file"
+    local_mysql "$db" -e "SET FOREIGN_KEY_CHECKS=0; DROP TABLE IF EXISTS $(sql_ident "$table")" 2>>"$err_file"
     if [ "$existed" -eq 1 ]; then
         if local_mysql "${import_args[@]}" "$db" < "$safety_file" 2>>"$err_file"; then
             echo "Rolled back: previous contents of '$db.$table' restored" >> "$err_file"
